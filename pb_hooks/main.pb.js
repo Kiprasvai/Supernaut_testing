@@ -4,6 +4,43 @@ routerAdd("GET", "/api/supernaut/ready", (event) => {
   return event.json(200, { ok: true });
 });
 
+// A YouTube URL is an optional opt-in source. Resolution and public Atom RSS
+// ingestion are best-effort so a bad URL never prevents the manual channel
+// creation flow. Helpers must be required inside each isolated callback VM.
+onRecordCreateRequest((e) => {
+  e.next();
+  if (!e.record.getString("youtube_url")) return;
+  try {
+    const { syncChannel } = require(__hooks + "/youtube_rss.js");
+    syncChannel(e.app, e.record);
+  } catch (error) {
+    try { e.app.logger().warn("YouTube RSS create sync failed", "channel", e.record.id); } catch (_) {}
+  }
+}, "channels");
+
+onRecordUpdateRequest((e) => {
+  const currentUrl = e.record.getString("youtube_url");
+  let previousUrl = currentUrl;
+  try { previousUrl = e.app.findRecordById("channels", e.record.id).getString("youtube_url"); } catch (_) {}
+  e.next();
+  if (currentUrl === previousUrl) return;
+  try {
+    const { syncChannel, clearYoutubeState } = require(__hooks + "/youtube_rss.js");
+    if (currentUrl) syncChannel(e.app, e.record);
+    else clearYoutubeState(e.app, e.record);
+  } catch (error) {
+    try { e.app.logger().warn("YouTube RSS update sync failed", "channel", e.record.id); } catch (_) {}
+  }
+}, "channels");
+
+// Public RSS strategy: every 30 minutes, poll a bounded batch of channels that
+// opted in by saving youtube_url. It uses no external API key and a bad source
+// is isolated so it cannot block the rest of the scheduled batch.
+cronAdd("practica-youtube-rss-poll", "*/30 * * * *", () => {
+  const { syncYoutubeChannels } = require(__hooks + "/youtube_rss.js");
+  syncYoutubeChannels($app);
+});
+
 // Keep manual pilot data internally consistent. These hooks do not ingest or
 // scrape captions; users create videos and transcript passages themselves.
 onRecordCreateRequest((e) => {
