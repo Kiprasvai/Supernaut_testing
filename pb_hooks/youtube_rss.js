@@ -600,12 +600,20 @@ function processCaptions(app, video) {
       throw new Error("YouTube captions returned " + (status || "no response"));
     }
     const rawCaption = textResponse(captionResponse);
-    if (!rawCaption || rawCaption.length > MAX_HTTP_BODY_CHARS) throw new Error("YouTube captions were unreadable");
     let captionJson;
-    try {
-      captionJson = JSON.parse(rawCaption);
-    } catch (_) {
-      throw new Error("YouTube captions returned malformed json3 data");
+    if (rawCaption) {
+      // Keep the raw-response cap when this PocketBase adapter exposes one.
+      if (rawCaption.length > MAX_HTTP_BODY_CHARS) throw new Error("YouTube captions were unreadable");
+      try {
+        captionJson = JSON.parse(rawCaption);
+      } catch (_) {
+        throw new Error("YouTube captions returned malformed json3 data");
+      }
+    } else if (captionResponse && captionResponse.json && typeof captionResponse.json === "object") {
+      // Other PocketBase versions parse a JSON response before returning it.
+      captionJson = captionResponse.json;
+    } else {
+      throw new Error("YouTube captions were unreadable");
     }
     const passages = boundedPassages(captionJson);
     const collection = app.findCollectionByNameOrId("transcript_passages");
