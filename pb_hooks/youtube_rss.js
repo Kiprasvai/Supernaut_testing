@@ -6,6 +6,10 @@
 
 const YOUTUBE_PAGE_TIMEOUT_SECONDS = 10;
 const YOUTUBE_RSS_TIMEOUT_SECONDS = 10;
+// Handle pages currently exceed 1 MB (for example, @GoogleDevelopers is about
+// 1.61 MB). Keep a separate, bounded allowance for the allowlisted HTML page;
+// RSS feeds retain their stricter 1 MB cap.
+const MAX_YOUTUBE_PAGE_BODY_CHARS = 2000000;
 const MAX_HTTP_BODY_CHARS = 1000000;
 const MAX_RECENT_VIDEOS = 20;
 const MAX_POLLED_CHANNELS = 20;
@@ -81,7 +85,7 @@ function fetchPublicPageChannelId(source) {
     throw new Error("YouTube channel page returned " + (response ? response.statusCode : "no response"));
   }
   const body = textResponse(response);
-  if (!body || body.length > MAX_HTTP_BODY_CHARS) throw new Error("YouTube channel page was unreadable");
+  if (!body || body.length > MAX_YOUTUBE_PAGE_BODY_CHARS) throw new Error("YouTube channel page was unreadable");
 
   // These are public page metadata shapes. We only accept the verified UC...
   // identifier returned by YouTube; a handle is never transformed or guessed.
