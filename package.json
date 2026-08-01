@@ -1,0 +1,19 @@
+{
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "pocketbase": "latest"
+  },
+  "devDependencies": {
+    "vite": "latest",
+    "wrangler": "latest",
+    "typescript": "latest"
+  },
+  "name": "pocketbase-frontend",
+  "private": true,
+  "type": "module"
+}

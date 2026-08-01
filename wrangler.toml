@@ -1,0 +1,9 @@
+name = "supernaut-managed-frontend"
+compatibility_date = "2026-06-22"
+
+[build]
+command = "npm install && npm run build"
+
+[assets]
+directory = "./public"
+not_found_handling = "single-page-application"
