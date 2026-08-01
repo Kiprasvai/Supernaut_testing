@@ -4,9 +4,10 @@ routerAdd("GET", "/api/supernaut/ready", (event) => {
   return event.json(200, { ok: true });
 });
 
-// A YouTube URL is an optional opt-in source. Resolution and public Atom RSS
-// ingestion are best-effort so a bad URL never prevents the manual channel
-// creation flow. Helpers must be required inside each isolated callback VM.
+// A YouTube URL is an optional opt-in source. Resolution, public Atom RSS
+// ingestion, and bounded public-caption follow-up are best-effort so a bad URL
+// never prevents the manual channel creation flow. Helpers must be required
+// inside each isolated callback VM.
 onRecordCreateRequest((e) => {
   e.next();
   if (!e.record.getString("youtube_url")) return;
@@ -33,16 +34,16 @@ onRecordUpdateRequest((e) => {
   }
 }, "channels");
 
-// Public RSS strategy: every 30 minutes, poll a bounded batch of channels that
-// opted in by saving youtube_url. It uses no external API key and a bad source
-// is isolated so it cannot block the rest of the scheduled batch.
+// Public RSS strategy: every 30 minutes, poll a bounded batch of opted-in
+// channels and drain a small public-caption/brief queue for each. It uses no
+// YouTube API key, and a bad source is isolated from the scheduled batch.
 cronAdd("practica-youtube-rss-poll", "*/30 * * * *", () => {
   const { syncYoutubeChannels } = require(__hooks + "/youtube_rss.js");
   syncYoutubeChannels($app);
 });
 
-// Keep manual pilot data internally consistent. These hooks do not ingest or
-// scrape captions; users create videos and transcript passages themselves.
+// Keep manual pilot data internally consistent. Manual videos and transcripts
+// remain fully supported alongside the bounded automatic public-caption pipeline.
 onRecordCreateRequest((e) => {
   const { ensureRelatedWorkspace } = require(__hooks + "/practica_utils.js");
   ensureRelatedWorkspace(e.app, e.record.getString("workspace"), e.record.getString("channel"), "channels");

@@ -70,7 +70,102 @@ function fmtTime(seconds = 0) {
 }
 function fmtDate(value: string) {
   if (!value) return 'No expiry';
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(value));
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Date unavailable';
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
+}
+
+type StatusTone = 'ready' | 'working' | 'warning' | 'critical' | 'neutral';
+type VideoStatus = { label: string; detail?: string; tone: StatusTone };
+
+function firstVideoField(video: Row, names: string[]) {
+  for (const name of names) {
+    const value = video[name];
+    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+  }
+  return '';
+}
+function statusToken(value: unknown) {
+  return String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+function isAutomaticVideo(video: Row) {
+  const sourceKind = statusToken(firstVideoField(video, ['source_type', 'source_kind', 'ingestion_source']));
+  return Boolean(video.youtube_video_id || video.automatic_source || sourceKind === 'youtube' || sourceKind === 'automatic' || firstVideoField(video, ['caption_status', 'transcript_ingestion_status', 'brief_ingestion_status']));
+}
+function ingestionError(video: Row, kind: 'transcript' | 'brief') {
+  const names = kind === 'transcript'
+    ? ['caption_status_detail', 'transcript_status_detail', 'transcript_error_message', 'transcript_ingestion_error', 'transcript_error']
+    : ['brief_status_detail', 'brief_error_message', 'brief_ingestion_error', 'brief_error'];
+  return String(firstVideoField(video, names.concat(['ingestion_error_message', 'ingestion_error', 'error_message', 'processing_error'])) || '').trim().replace(/public-caption/gi, 'caption').replace(/^Automatic brief failed:\s*/i, '');
+}
+function statusDate(video: Row, names: string[], verb: string) {
+  const value = String(firstVideoField(video, names) || '');
+  return value ? `${verb} ${fmtDate(value)}` : '';
+}
+function joinStatusDetail(...parts: string[]) {
+  return parts.filter(Boolean).join(' · ');
+}
+function transcriptStatus(video: Row, hasPassages = false): VideoStatus {
+  const automatic = isAutomaticVideo(video);
+  const language = transcriptLanguage(video);
+  if (hasPassages || video.manual_source) {
+    const completed = automatic && !video.manual_source ? statusDate(video, ['caption_completed_at', 'transcript_completed_at'], 'Imported') : '';
+    return { label: video.manual_source ? 'Manual transcript ready' : automatic ? 'Captions imported' : 'Transcript ready', detail: joinStatusDetail(language, completed), tone: 'ready' };
+  }
+  if (!automatic) return { label: 'Manual transcript not added', detail: 'Add transcript text when it is available.', tone: 'neutral' };
+  const status = statusToken(firstVideoField(video, ['transcript_ingestion_status', 'transcript_status', 'caption_status', 'captions_status', 'ingestion_status']));
+  const detail = ingestionError(video, 'transcript');
+  if (['ready', 'complete', 'completed', 'succeeded', 'success', 'available', 'imported'].includes(status)) return { label: 'Captions imported', detail: joinStatusDetail(language, statusDate(video, ['caption_completed_at', 'transcript_completed_at'], 'Imported')), tone: 'ready' };
+  if (['unavailable', 'captions_unavailable', 'no_captions', 'not_available', 'not_found', 'missing'].includes(status)) return { label: 'Captions unavailable', detail: detail ? `${detail} Add a manual transcript to continue.` : 'Add a manual transcript to continue.', tone: 'warning' };
+  if (['failed', 'error'].includes(status)) return { label: 'Caption import failed', detail: detail || 'Add a manual transcript or try again later.', tone: 'critical' };
+  if (['processing', 'importing', 'in_progress', 'fetching', 'retrieving', 'transcribing'].includes(status)) return { label: 'Retrieving captions', detail: detail || statusDate(video, ['caption_last_attempt_at', 'transcript_last_attempt_at'], 'Started') || 'This usually finishes shortly.', tone: 'working' };
+  return { label: 'Caption import queued', detail: detail || 'Practica will check for available captions.', tone: 'working' };
+}
+function briefStatus(video: Row, brief?: Row): VideoStatus {
+  if (brief) return { label: 'Brief ready', detail: statusDate(video, ['brief_completed_at'], 'Prepared'), tone: 'ready' };
+  if (!isAutomaticVideo(video)) return { label: 'Team brief not added', tone: 'neutral' };
+  const status = statusToken(firstVideoField(video, ['brief_ingestion_status', 'brief_status', 'summary_status']));
+  const detail = ingestionError(video, 'brief');
+  if (['failed', 'error'].includes(status)) return { label: 'Brief could not be created', detail: detail || 'The transcript remains available to read and use.', tone: 'critical' };
+  if (['not_applicable', 'unavailable'].includes(status)) return { label: 'Brief unavailable', detail: detail || 'Add a manual transcript before creating a brief.', tone: 'warning' };
+  if (['processing', 'importing', 'in_progress', 'generating', 'creating'].includes(status)) return { label: 'Preparing brief', detail: detail || statusDate(video, ['brief_last_attempt_at'], 'Started') || 'The transcript remains available while this finishes.', tone: 'working' };
+  if (['ready', 'complete', 'completed', 'succeeded', 'success', 'available'].includes(status)) return { label: 'Brief ready', detail: statusDate(video, ['brief_completed_at'], 'Prepared'), tone: 'ready' };
+  return { label: 'Brief pending', detail: detail || 'It starts after a transcript is available.', tone: 'working' };
+}
+function transcriptLanguage(video: Row) {
+  const raw = String(firstVideoField(video, ['transcript_language', 'caption_language', 'captions_language', 'language', 'language_code']) || '').trim();
+  if (!raw) return '';
+  const code = raw.toLowerCase().split(/[-_]/)[0];
+  try {
+    const name = new Intl.DisplayNames([navigator.language], { type: 'language' }).of(code);
+    return name ? `${name} captions` : `${raw} captions`;
+  } catch { return `${raw.toUpperCase()} captions`; }
+}
+function videoTiming(video: Row) {
+  if (isAutomaticVideo(video)) {
+    const published = String(firstVideoField(video, ['youtube_published_at', 'published_at', 'source_published_at']) || '');
+    return published ? `Published ${fmtDate(published)}` : video.created ? `Discovered ${fmtDate(video.created)}` : 'Discovered automatically';
+  }
+  return video.created ? `Added ${fmtDate(video.created)}` : 'Added manually';
+}
+function statusRow(kind: string, status: VideoStatus) {
+  return `<div class="status-row ${status.tone}"><span class="status-dot" aria-hidden="true"></span><span><strong>${esc(kind)}</strong>${esc(status.label)}${status.detail ? `<small>${esc(status.detail)}</small>` : ''}</span></div>`;
+}
+function feedSummary(video: Row, brief: Row | undefined, transcript: VideoStatus, briefState: VideoStatus) {
+  if (brief) return `<p>${esc(brief.summary)}</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read cited source transcript</button>`;
+  if (briefState.tone === 'critical') return `<div class="feed-message critical-message"><strong>Brief could not be created.</strong><span>${esc(briefState.detail || 'The transcript remains available to read and use.')}</span></div>${transcript.tone === 'ready' ? `<button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read the transcript</button>` : ''}`;
+  if (transcript.tone === 'warning' || transcript.tone === 'critical') return `<div class="feed-message warning-message"><strong>${esc(transcript.label)}.</strong><span>${esc(transcript.detail || 'Add a manual transcript to continue.')}</span></div><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Open to add transcript manually</button>`;
+  if (briefState.tone === 'warning') return `<div class="feed-message warning-message"><strong>${esc(briefState.label)}.</strong><span>${esc(briefState.detail || 'The transcript remains available to read and use.')}</span></div>${transcript.tone === 'ready' ? `<button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read the transcript</button>` : ''}`;
+  if (transcript.tone === 'ready' && briefState.tone === 'working') return `<p class="muted-copy">The transcript is ready. Practica is preparing the source-backed brief.</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read the transcript now</button>`;
+  if (isAutomaticVideo(video)) return `<p class="muted-copy">Practica found this video and is checking for captions before preparing its brief.</p>`;
+  if (transcript.tone === 'ready') return `<p class="muted-copy">The manual transcript is ready. Add a team brief when there is a takeaway to share.</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read the transcript</button>`;
+  return `<p class="muted-copy">No brief or transcript yet. Add source text when it is available.</p>`;
+}
+function transcriptEmptyState(video: Row, status: VideoStatus) {
+  const automatic = isAutomaticVideo(video);
+  const heading = status.tone === 'warning' ? 'Captions are not available for this video' : status.tone === 'critical' ? 'Captions could not be imported' : status.tone === 'ready' ? 'Transcript text is not available yet' : status.tone === 'working' && automatic ? status.label : 'Add a transcript to use this source';
+  const copy = status.tone === 'ready' ? 'This video is marked as having a transcript, but no passages are available. Add transcript text manually to continue.' : status.detail || (automatic ? 'Practica is checking for available captions. You can add transcript text manually at any time.' : 'Paste transcript text to make passages selectable, citable, and available to grounded Q&A.');
+  return `<div class="empty-state compact"><div class="empty-symbol">${icon(status.tone === 'critical' || status.tone === 'warning' ? 'warning' : 'library')}</div><h2>${esc(heading)}</h2><p>${esc(copy)}</p><button class="primary" data-action="open-transcript">Add transcript manually</button></div>`;
 }
 function pbMessage(error: any, fallback: string) {
   return error?.response?.message || error?.response?.data?.message || error?.message || fallback;
@@ -142,7 +237,7 @@ async function loadWorkspace() {
   const filter = filterWorkspace();
   const [channels, videos, briefs, folders, saves, highlights] = await Promise.all([
     pb.collection('channels').getFullList<Row>({ filter, sort: 'name' }),
-    pb.collection('videos').getFullList<Row>({ filter, sort: 'title' }),
+    pb.collection('videos').getFullList<Row>({ filter, sort: '-youtube_published_at,-created' }),
     pb.collection('video_briefs').getFullList<Row>({ filter, sort: 'title' }),
     pb.collection('research_folders').getFullList<Row>({ filter, sort: 'name' }),
     pb.collection('saved_passage_items').getFullList<Row>({ filter, expand: 'passage,passage.video,folder' }),
@@ -194,7 +289,7 @@ function shell(content: string, section = '') {
     <main class="main-view">${content}</main>
     <nav class="mobile-nav" aria-label="Mobile navigation">
       <button class="${section === 'briefing' ? 'active' : ''}" data-action="navigate" data-path="/">${icon('home')}<span>Briefing</span></button>
-      <button class="mobile-add" data-action="open-video" aria-label="Add video">${icon('plus')}</button>
+      <button class="mobile-add" data-action="open-video" aria-label="Add a video manually">${icon('plus')}</button>
       <button class="${section === 'library' ? 'active' : ''}" data-action="navigate" data-path="/library">${icon('library')}<span>Library</span></button>
     </nav>
     ${dialogs()}
@@ -257,32 +352,39 @@ function onboardingView() {
 function feedView() {
   const channelPills = state.channels.map((channel) => `<button class="filter-chip ${state.channelFilter === channel.id ? 'selected' : ''}" data-action="filter-channel" data-id="${channel.id}" aria-pressed="${state.channelFilter === channel.id}">${esc(channel.name)}</button>`).join('');
   const visibleVideos = state.channelFilter ? state.videos.filter((video) => video.channel === state.channelFilter) : state.videos;
+  const selectedChannel = state.channels.find((channel) => channel.id === state.channelFilter);
   const items = visibleVideos.map((video) => {
     const channel = state.channels.find((item) => item.id === video.channel);
     const brief = state.briefs.find((item) => item.video === video.id);
+    const transcript = transcriptStatus(video);
+    const briefState = briefStatus(video, brief);
     return `<article class="feed-item">
-      <button class="video-thumb" data-action="open-video-id" data-id="${video.id}" aria-label="Open ${esc(video.title)} transcript"><span>${icon('play')}</span><small>${video.duration_seconds ? fmtTime(video.duration_seconds) : 'Text source'}</small></button>
+      <button class="video-thumb" data-action="open-video-id" data-id="${video.id}" aria-label="Open ${esc(video.title)} transcript"><span>${icon('play')}</span><small>${video.duration_seconds ? fmtTime(video.duration_seconds) : isAutomaticVideo(video) ? 'YouTube' : 'Text source'}</small></button>
       <div class="feed-copy">
-        <div class="feed-meta"><span>${esc(channel?.name || 'Unsorted')}</span><span>·</span><time>${video.created ? fmtDate(video.created) : 'Pilot source'}</time></div>
+        <div class="feed-meta"><span>${esc(channel?.name || 'Unsorted')}</span><span>·</span><time>${esc(videoTiming(video))}</time></div>
         <button class="title-link" data-action="open-video-id" data-id="${video.id}"><h2>${esc(video.title)}</h2></button>
-        ${brief ? `<p>${esc(brief.summary)}</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read cited source transcript</button>` : `<p class="muted-copy">No brief yet. Open the transcript to select source passages and ask a grounded question.</p>`}
+        ${feedSummary(video, brief, transcript, briefState)}
       </div>
-      <div class="feed-status"><span class="status-dot ${video.manual_source ? 'manual' : ''}"></span><span>${video.manual_source ? 'Transcript added manually' : 'Awaiting manual transcript'}</span></div>
+      <div class="feed-status" aria-label="Video processing status">${statusRow('Transcript', transcript)}${statusRow('Brief', briefState)}</div>
     </article>`;
   }).join('');
+  const monitoredEmpty = Boolean(selectedChannel?.youtube_url);
   return shell(`<header class="page-header">
-      <div><p class="kicker">Team briefing</p><h1>What your team is learning</h1><p>Source-first notes from the channels you follow.</p></div>
-      <button class="primary" data-action="open-video">${icon('plus')} Add video & transcript</button>
+      <div><p class="kicker">Team briefing</p><h1>What your team is learning</h1><p>New videos, transcripts, and source-backed briefs from the channels you follow.</p></div>
+      <button class="primary" data-action="open-video">${icon('plus')} Add video manually</button>
     </header>
-    <section class="feed-toolbar" aria-label="Feed filters"><button class="filter-chip ${state.channelFilter ? '' : 'selected'}" data-action="filter-channel" data-id="" aria-pressed="${!state.channelFilter}">All sources</button>${channelPills}<button class="filter-chip add-chip" data-action="open-channel">${icon('plus')} Channel</button></section>
+    <section class="feed-toolbar" aria-label="Feed filters"><button class="filter-chip ${state.channelFilter ? '' : 'selected'}" data-action="filter-channel" data-id="" aria-pressed="${!state.channelFilter}">All sources</button>${channelPills}<button class="filter-chip add-chip" data-action="open-channel">${icon('plus')} Monitor channel</button></section>
     <section class="feed-list" aria-label="Workspace briefing">
-      ${items || (state.channelFilter ? `<div class="empty-state compact"><div class="empty-symbol">${icon('play')}</div><h2>No videos in this channel yet</h2><p>Add a manual source to this channel, or return to all sources.</p><div><button class="primary" data-action="open-video">Add a video</button><button class="secondary" data-action="filter-channel" data-id="">View all sources</button></div></div>` : `<div class="empty-state"><div class="empty-symbol">${icon('play')}</div><h2>Start with a source your team already trusts</h2><p>Add a channel, then paste a video link and its transcript. Practica keeps pilot intake manual and visible—nothing is fetched behind the scenes.</p><div><button class="primary" data-action="open-video">Add your first video</button><button class="secondary" data-action="open-channel">Add a channel</button></div></div>`)}
+      ${items || (state.channelFilter ? `<div class="empty-state compact"><div class="empty-symbol">${icon('play')}</div><h2>No videos in this channel yet</h2><p>${monitoredEmpty ? 'Practica is monitoring this public channel. New videos will appear here after they are published and discovered.' : 'This is a manual channel. Add a video and transcript when you are ready.'}</p><div><button class="primary" data-action="open-video">Add a video manually</button><button class="secondary" data-action="filter-channel" data-id="">View all sources</button></div></div>` : `<div class="empty-state"><div class="empty-symbol">${icon('play')}</div><h2>Follow a channel once. Keep up automatically.</h2><p>Add a public YouTube channel URL or @handle. Practica will monitor it for new videos, retrieve available captions, and prepare transcript-backed briefs. Manual video and transcript entry stays available whenever you need it.</p><div><button class="primary" data-action="open-channel">Monitor a YouTube channel</button><button class="secondary" data-action="open-video">Add a video manually</button></div></div>`)}
     </section>`, 'briefing');
 }
 
 function transcriptView(video: Row) {
   const brief = state.briefs.find((item) => item.video === video.id);
   const selectedCount = state.selectedPassages.size;
+  const transcript = transcriptStatus(video, state.passages.length > 0);
+  const briefState = briefStatus(video, brief);
+  const language = transcriptLanguage(video);
   const passages = state.passages.map((passage) => {
     const selected = state.selectedPassages.has(passage.id);
     const highlighted = state.highlights.some((item) => item.passage === passage.id);
@@ -305,9 +407,9 @@ function transcriptView(video: Row) {
     </div>
     <div class="reader-layout">
       <section class="transcript-panel">
-        <header class="transcript-header"><div class="feed-meta"><span>${esc(state.channels.find((item) => item.id === video.channel)?.name || 'Workspace source')}</span><span>·</span><span>${video.manual_source ? 'Manual transcript' : 'Transcript pending'}</span></div><h1>${esc(video.title)}</h1>${brief ? `<div class="brief-inline"><strong>${esc(brief.title || 'Source brief')}</strong><p>${esc(brief.summary)}</p></div>` : ''}<div class="transcript-meta"><span>${icon('clock')} ${video.duration_seconds ? fmtTime(video.duration_seconds) : 'Length not set'}</span><span>${state.passages.length} passages</span></div></header>
+        <header class="transcript-header"><div class="feed-meta"><span>${esc(state.channels.find((item) => item.id === video.channel)?.name || 'Workspace source')}</span><span>·</span><span>${esc(videoTiming(video))}</span></div><h1>${esc(video.title)}</h1><div class="source-status-panel" aria-label="Video processing status">${statusRow('Transcript', transcript)}${statusRow('Brief', briefState)}</div>${brief ? `<div class="brief-inline"><strong>${esc(brief.title || 'Source brief')}</strong><p>${esc(brief.summary)}</p></div>` : ''}<div class="transcript-meta"><span>${icon('clock')} ${video.duration_seconds ? fmtTime(video.duration_seconds) : 'Length not set'}</span><span>${state.passages.length} ${state.passages.length === 1 ? 'passage' : 'passages'}</span>${language ? `<span>${esc(language)}</span>` : ''}</div></header>
         <div class="selection-bar ${selectedCount ? 'visible' : ''}" aria-live="polite"><strong>${selectedCount} selected</strong><button data-action="open-highlight">${icon('highlight')} Highlight</button><button data-action="open-save">${icon('bookmark')} Save</button><button data-action="clear-selection">Clear</button></div>
-        <div class="transcript-list">${passages || `<div class="empty-state compact"><div class="empty-symbol">${icon('library')}</div><h2>Transcript intake is still pending</h2><p>This pilot does not claim automatic captions. Add transcript text manually to make passages selectable and available to grounded Q&A.</p><button class="primary" data-action="open-transcript">Add transcript text</button></div>`}</div>
+        <div class="transcript-list">${passages || transcriptEmptyState(video, transcript)}</div>
       </section>
       <aside class="qa-panel"><div class="qa-heading"><div><p class="kicker">Ask this source</p><h2>Grounded Q&A</h2></div><span class="grounded-badge">Transcript only</span></div><p class="qa-intro">Answers use up to 50 ${selectedCount ? 'selected' : 'available'} passages and must cite this transcript.</p>${answer}${state.answerError ? `<div class="error-banner" role="alert">${icon('warning')}<span>${esc(state.answerError)} You can still read and cite the transcript.</span></div>` : ''}<form id="qa-form"><label for="question">Your question</label><textarea id="question" name="question" required maxlength="4000" placeholder="What evidence does the speaker give for…?"></textarea><button class="primary full" type="submit" ${state.busy || !state.passages.length ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span> Checking the source' : `Ask Practica ${icon('arrow')}`}</button></form><p class="privacy-note">Practica sends only the selected transcript passages to the grounded-answer service.</p></aside>
     </div>`, 'briefing');
@@ -347,9 +449,9 @@ function dialogs() {
   const channels = state.channels.map((channel) => `<option value="${channel.id}">${esc(channel.name)}</option>`).join('');
   const folders = state.folders.map((folder) => `<option value="${folder.id}">${esc(folder.name)}</option>`).join('');
   const shares = getLocalShares().filter((share) => !state.selectedVideo || share.videoId === state.selectedVideo.id);
-  return `<dialog id="channel-dialog"><form method="dialog" class="dialog-form" id="channel-form"><div class="dialog-head"><div><p class="kicker">Shared source</p><h2>Add a channel</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><p>Add a public YouTube URL or @handle to automatically discover recent public videos. Leave it blank to create a manual channel for videos and transcripts you add yourself.</p><label>Channel name<input name="name" required maxlength="160" placeholder="e.g. Latent Space"></label><label>Public YouTube URL or @handle <span>Optional</span><input name="youtube_url" maxlength="2000" inputmode="url" placeholder="https://youtube.com/@channel or @channel"></label><label>Description <span>Optional</span><textarea name="description" maxlength="2000" placeholder="Why your team follows this source"></textarea></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add channel</button></div></form></dialog>
-  <dialog id="video-dialog"><form method="dialog" class="dialog-form wide" id="video-form"><div class="dialog-head"><div><p class="kicker">Manual pilot intake</p><h2>Add a video and transcript</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><div class="manual-note">${icon('warning')}<p><strong>Transcript text is added by you.</strong> Practica does not automatically fetch captions in this pilot.</p></div><div class="form-grid"><label>Video title<input name="title" required maxlength="300" placeholder="A title your team will recognize"></label><label>Channel<select name="channel"><option value="">No channel</option>${channels}</select></label><label class="full-field">Source URL <span>Optional</span><input name="source_url" type="url" maxlength="2000" placeholder="https://youtube.com/watch?v=…"></label><label>Duration in minutes <span>Optional</span><input name="duration" type="number" min="0" step="0.1" placeholder="42"></label><label>Speaker name <span>Optional</span><input name="speaker" maxlength="160" placeholder="Used for each passage"></label><label class="full-field">Transcript text <span>Optional now; add later from the reader</span><textarea class="transcript-input" name="transcript" placeholder="Paste the transcript. Separate passages with blank lines for easier reading and citation."></textarea></label><label class="full-field">Brief summary <span>Optional, written by your team</span><textarea name="brief" maxlength="30000" placeholder="Capture the practical takeaway without overstating the source."></textarea></label></div><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add to briefing</button></div></form></dialog>
-  <dialog id="transcript-dialog"><form method="dialog" class="dialog-form wide" id="transcript-form"><div class="dialog-head"><div><p class="kicker">Manual pilot intake</p><h2>Add transcript text</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><div class="manual-note">${icon('warning')}<p>Paste source text below. Blank lines become separately selectable, citable passages.</p></div><label>Speaker <span>Optional</span><input name="speaker" maxlength="160" placeholder="Speaker or host"></label><label>Transcript text<textarea class="transcript-input" name="transcript" required placeholder="Paste transcript text here…"></textarea></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add transcript</button></div></form></dialog>
+  return `<dialog id="channel-dialog"><form method="dialog" class="dialog-form" id="channel-form"><div class="dialog-head"><div><p class="kicker">Automatic monitoring</p><h2>Follow a YouTube channel</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><p>Add the public channel URL or @handle once. Practica will monitor it for newly published videos, retrieve captions when the creator makes them available, and prepare transcript-backed briefs. Leave the URL blank only if you want a manual channel.</p><label>Channel name<input name="name" required maxlength="160" placeholder="e.g. Latent Space"></label><label>Public YouTube channel URL or @handle <span>Required for automatic monitoring</span><input name="youtube_url" maxlength="2000" inputmode="url" placeholder="https://youtube.com/@channel or @channel"></label><label>Description <span>Optional</span><textarea name="description" maxlength="2000" placeholder="Why your team follows this source"></textarea></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add channel</button></div></form></dialog>
+  <dialog id="video-dialog"><form method="dialog" class="dialog-form wide" id="video-form"><div class="dialog-head"><div><p class="kicker">Manual fallback</p><h2>Add a video yourself</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><div class="manual-note">${icon('warning')}<p><strong>Use this when a source is not monitored or captions are unavailable.</strong> You can add the video now and paste its transcript or brief now or later.</p></div><div class="form-grid"><label>Video title<input name="title" required maxlength="300" placeholder="A title your team will recognize"></label><label>Channel<select name="channel"><option value="">No channel</option>${channels}</select></label><label class="full-field">Source URL <span>Optional</span><input name="source_url" type="url" maxlength="2000" placeholder="https://youtube.com/watch?v=…"></label><label>Duration in minutes <span>Optional</span><input name="duration" type="number" min="0" step="0.1" placeholder="42"></label><label>Speaker name <span>Optional</span><input name="speaker" maxlength="160" placeholder="Used for each passage"></label><label class="full-field">Transcript text <span>Optional now; add later from the reader</span><textarea class="transcript-input" name="transcript" placeholder="Paste the transcript. Separate passages with blank lines for easier reading and citation."></textarea></label><label class="full-field">Brief summary <span>Optional, written by your team</span><textarea name="brief" maxlength="30000" placeholder="Capture the practical takeaway without overstating the source."></textarea></label></div><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add to briefing</button></div></form></dialog>
+  <dialog id="transcript-dialog"><form method="dialog" class="dialog-form wide" id="transcript-form"><div class="dialog-head"><div><p class="kicker">Manual fallback</p><h2>Add transcript text</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><div class="manual-note">${icon('warning')}<p>Paste transcript text when captions are unavailable or you have a better source. Blank lines become separately selectable, citable passages.</p></div><label>Speaker <span>Optional</span><input name="speaker" maxlength="160" placeholder="Speaker or host"></label><label>Transcript text<textarea class="transcript-input" name="transcript" required placeholder="Paste transcript text here…"></textarea></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Add transcript</button></div></form></dialog>
   <dialog id="highlight-dialog"><form method="dialog" class="dialog-form" id="highlight-form"><div class="dialog-head"><div><p class="kicker">${state.selectedPassages.size} selected</p><h2>Highlight passages</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><label>Note <span>Optional</span><textarea name="note" maxlength="10000" placeholder="Why does this matter to your work?"></textarea></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Save highlight</button></div></form></dialog>
   <dialog id="save-dialog"><form method="dialog" class="dialog-form" id="save-form"><div class="dialog-head"><div><p class="kicker">${state.selectedPassages.size} selected</p><h2>Save to research</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><label>Folder<select name="folder"><option value="">Unfiled</option>${folders}</select></label><label>Note <span>Optional</span><textarea name="note" maxlength="10000" placeholder="Add context for your future self"></textarea></label><button class="text-button inline" type="button" data-action="open-folder">${icon('plus')} Create a folder first</button><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Save passages</button></div></form></dialog>
   <dialog id="folder-dialog"><form method="dialog" class="dialog-form" id="folder-form"><div class="dialog-head"><div><p class="kicker">Research library</p><h2>Create a folder</h2></div><button class="icon-button" value="cancel" aria-label="Close">${icon('close')}</button></div><label>Folder name<input name="name" required maxlength="160" placeholder="e.g. Evaluation methods"></label><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" type="submit" value="default">Create folder</button></div></form></dialog>
@@ -457,7 +559,8 @@ root.addEventListener('submit', async (event) => {
       state.workspace = workspace; state.workspaces = [workspace]; await loadWorkspace(); navigate('/'); announce('Workspace ready');
     }
     if (form.id === 'channel-form') {
-      await pb.collection('channels').create({ workspace: state.workspace!.id, name: String(data.get('name')).trim(), youtube_url: String(data.get('youtube_url')).trim(), description: String(data.get('description')).trim() }); dialog('channel-dialog')?.close(); await loadWorkspace(); announce('Channel added');
+      const youtubeUrl = String(data.get('youtube_url')).trim();
+      await pb.collection('channels').create({ workspace: state.workspace!.id, name: String(data.get('name')).trim(), youtube_url: youtubeUrl, description: String(data.get('description')).trim() }); dialog('channel-dialog')?.close(); await loadWorkspace(); announce(youtubeUrl ? 'Channel monitoring started' : 'Manual channel added');
     }
     if (form.id === 'video-form') {
       const transcript = String(data.get('transcript')).trim();
@@ -465,7 +568,7 @@ root.addEventListener('submit', async (event) => {
       if (transcript) await createPassages(video.id, transcript, String(data.get('speaker')).trim());
       const brief = String(data.get('brief')).trim();
       if (brief) await pb.collection('video_briefs').create({ workspace: state.workspace!.id, video: video.id, title: 'Team brief', summary: brief, created_by: pb.authStore.record!.id });
-      dialog('video-dialog')?.close(); form.reset(); await loadWorkspace(); announce(transcript ? 'Video and manual transcript added' : 'Video added—transcript still pending');
+      dialog('video-dialog')?.close(); form.reset(); await loadWorkspace(); announce(transcript ? 'Video and manual transcript added' : 'Manual video added—transcript can be added later');
     }
     if (form.id === 'transcript-form') {
       await createPassages(state.selectedVideo!.id, String(data.get('transcript')), String(data.get('speaker')).trim(), state.passages.length);
