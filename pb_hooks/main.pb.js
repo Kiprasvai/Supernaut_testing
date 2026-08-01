@@ -67,7 +67,9 @@ routerAdd("POST", "/api/practica/questions", (e) => {
   if (!apiKey) {
     throw new ApiError(503, "Grounded Q&A is not configured. Set OPENROUTER_API_KEY on the backend.");
   }
-  const model = $os.getenv("OPENROUTER_MODEL") || "meta-llama/llama-3.1-8b-instruct:free";
+  // Keep deployments configurable, while routing the no-config default only to
+  // OpenRouter's supported free-model router.
+  const model = $os.getenv("OPENROUTER_MODEL") || "openrouter/free";
   const citations = context.passages.map(passageCitation);
   let transcript = "";
   for (const citation of citations) {
@@ -101,7 +103,13 @@ routerAdd("POST", "/api/practica/questions", (e) => {
   }
   if (provider.statusCode < 200 || provider.statusCode >= 300) {
     e.app.logger().warn("OpenRouter grounded Q&A request failed", "status", provider.statusCode);
-    throw new ApiError(provider.statusCode === 429 ? 429 : 502, provider.statusCode === 429 ? "Grounded Q&A is temporarily rate limited. Please retry." : "Grounded Q&A provider failed. Please retry.");
+    if (provider.statusCode === 429) {
+      throw new ApiError(429, "Grounded Q&A is temporarily rate limited. Please retry.");
+    }
+    if (provider.statusCode === 404) {
+      throw new ApiError(502, "Grounded Q&A model is unavailable. Please ask an administrator to review the backend model configuration.");
+    }
+    throw new ApiError(502, "Grounded Q&A provider failed. Please retry.");
   }
 
   const content = provider.json && provider.json.choices && provider.json.choices[0] && provider.json.choices[0].message && provider.json.choices[0].message.content;
@@ -236,7 +244,16 @@ routerAdd("GET", "/api/practica/shares/{token}", (e) => {
     },
   };
   if (share.getString("scope") === "brief") {
-    const briefs = e.app.findRecordsByFilter("video_briefs", "video = {:video}", "-updated", 1, 0, { video: video.id });
+    let briefs;
+    try {
+      // The audit-date migration makes this the normal newest-brief order.
+      briefs = e.app.findRecordsByFilter("video_briefs", "video = {:video}", "-updated", 1, 0, { video: video.id });
+    } catch (_) {
+      // Keep an existing public link resolvable during a legacy malformed-schema
+      // recovery; id is PocketBase's guaranteed system field and exposes no
+      // additional data beyond the scoped projection below.
+      briefs = e.app.findRecordsByFilter("video_briefs", "video = {:video}", "-id", 1, 0, { video: video.id });
+    }
     projection.brief = briefs.length ? {
       id: briefs[0].id,
       title: briefs[0].getString("title"),
