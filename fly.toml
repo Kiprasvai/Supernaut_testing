@@ -1,0 +1,33 @@
+app = "sn-pb-repo-1319580342-ac825a"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile.supernaut-pocketbase"
+
+[mounts]
+  source = "pb_data"
+  destination = "/pb/pb_data"
+  initial_size = 3
+
+[http_service]
+  internal_port = 8090
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  # Generous grace_period so a slow first boot (running pending migrations
+  # before PocketBase serves) is not restarted by Fly mid-migration, which would
+  # boot-loop. Keep in step with HEALTH_POLL_TIMEOUT_MS in provisioning.
+  [[http_service.checks]]
+    method = "get"
+    path = "/api/health"
+    interval = "15s"
+    timeout = "10s"
+    grace_period = "300s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"
