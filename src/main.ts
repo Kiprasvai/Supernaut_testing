@@ -4,6 +4,8 @@ import type { RecordModel } from 'pocketbase';
 
 type Row = RecordModel & Record<string, any>;
 type Citation = { passage_id: string; position: number; start_seconds: number; end_seconds: number; speaker: string; text: string };
+type BriefCitation = { passageId: string; startSeconds?: number; timestampLabel?: string; text?: string };
+type BriefSourcePoint = { text: string; citations: BriefCitation[] };
 type Answer = { answer: string; supported: boolean; citations: Citation[]; model?: string };
 type PublicShare = { scope: 'video' | 'brief' | 'transcript'; video: { id: string; title: string; source_url: string; duration_seconds: number }; brief?: { id: string; title: string; summary: string } | null; transcript?: Citation[] };
 type LocalShare = { id: string; token: string; scope: string; expires_at: string; videoId: string; videoTitle: string; revoked?: boolean };
@@ -150,6 +152,69 @@ function videoTiming(video: Row) {
 }
 function statusRow(kind: string, status: VideoStatus) {
   return `<div class="status-row ${status.tone}"><span class="status-dot" aria-hidden="true"></span><span><strong>${esc(kind)}</strong>${esc(status.label)}${status.detail ? `<small>${esc(status.detail)}</small>` : ''}</span></div>`;
+}
+function briefTimestamp(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) return { startSeconds: value };
+  if (typeof value !== 'string' || !value.trim()) return {};
+  const trimmed = value.trim();
+  const numeric = Number(trimmed.replace(/s$/i, ''));
+  return Number.isFinite(numeric) ? { startSeconds: numeric } : { timestampLabel: trimmed };
+}
+function briefSourcePoints(brief?: Row): BriefSourcePoint[] {
+  if (!brief?.source_points) return [];
+  let value = brief.source_points;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return []; }
+  }
+  const items = Array.isArray(value) ? value : Array.isArray(value?.points) ? value.points : [];
+  return items.map((item: any) => {
+    if (!item || typeof item === 'string') return { text: String(item || '').trim(), citations: [] };
+    const text = String(item.point ?? item.text ?? item.claim ?? item.summary ?? item.content ?? '').trim();
+    const rawCitations = [
+      item.passage_ids,
+      item.passageIds,
+      item.cited_passage_ids,
+      item.citedPassageIds,
+      item.citations,
+      item.sources,
+      item.passages,
+      item.passage_id ?? item.passageId,
+    ].flatMap((candidate) => candidate === undefined || candidate === null ? [] : Array.isArray(candidate) ? candidate : [candidate]);
+    const timestamps = Array.isArray(item.timestamps) ? item.timestamps : [];
+    const citations = rawCitations.map((citation: any, index: number): BriefCitation | null => {
+      const passageId = String(typeof citation === 'object' ? citation.passage_id ?? citation.passageId ?? citation.id ?? '' : citation).trim();
+      if (!passageId) return null;
+      const timestamp = timestamps[index];
+      const citationTime = typeof citation === 'object' ? citation.start_seconds ?? citation.startSeconds ?? citation.timestamp ?? citation.start : undefined;
+      const itemTime = rawCitations.length === 1 ? item.start_seconds ?? item.startSeconds ?? item.timestamp ?? item.start : undefined;
+      const timestampValue = typeof timestamp === 'object' ? timestamp.start_seconds ?? timestamp.startSeconds ?? timestamp.timestamp ?? timestamp.start : timestamp;
+      return {
+        passageId,
+        ...briefTimestamp(citationTime ?? timestampValue ?? itemTime),
+        text: typeof citation === 'object' ? String(citation.text ?? citation.passage_text ?? '').trim() || undefined : undefined,
+      };
+    }).filter((citation): citation is BriefCitation => Boolean(citation));
+    const uniqueCitations = citations.filter((citation, index) => citations.findIndex((candidate) => candidate.passageId === citation.passageId) === index);
+    return { text, citations: uniqueCitations };
+  }).filter((point: BriefSourcePoint) => point.text);
+}
+function renderBriefInline(brief: Row) {
+  const points = briefSourcePoints(brief);
+  if (!points.length) return `<div class="brief-inline"><strong>${esc(brief.title || 'Source brief')}</strong><p class="brief-summary">${esc(brief.summary)}</p></div>`;
+  const sourcePoints = points.map((point, pointIndex) => {
+    const citations = point.citations.map((citation, citationIndex) => {
+      const passage = state.passages.find((item) => item.id === citation.passageId);
+      const position = Number(passage?.position);
+      const sourceLabel = Number.isFinite(position) ? `Passage ${position + 1}` : `Source ${citationIndex + 1}`;
+      const startSeconds = Number(passage?.start_seconds ?? citation.startSeconds);
+      const timestamp = Number.isFinite(startSeconds) ? fmtTime(startSeconds) : citation.timestampLabel || '';
+      const excerpt = String(passage?.text || citation.text || '').trim();
+      if (!passage) return `<span class="brief-citation unavailable"><span>${esc(sourceLabel)}</span><span>${timestamp ? `${esc(timestamp)} · ` : ''}Cited passage unavailable</span></span>`;
+      return `<button class="brief-citation" data-action="jump-citation" data-id="${esc(citation.passageId)}" aria-label="Jump to ${esc(sourceLabel)}${timestamp ? ` at ${esc(timestamp)}` : ''}"><span>${esc(sourceLabel)}</span><span>${timestamp ? `<time>${esc(timestamp)}</time><i aria-hidden="true">·</i>` : ''}${esc(excerpt.slice(0, 110))}${excerpt.length > 110 ? '…' : ''}</span></button>`;
+    }).join('');
+    return `<li class="brief-point"><p>${esc(point.text)}</p>${citations ? `<div class="brief-point-citations" aria-label="Sources for brief point ${pointIndex + 1}">${citations}</div>` : ''}</li>`;
+  }).join('');
+  return `<section class="brief-inline brief-sourced" aria-labelledby="brief-title-${esc(brief.id)}"><div class="brief-heading"><strong id="brief-title-${esc(brief.id)}">${esc(brief.title || 'Source brief')}</strong><span>${points.length} cited ${points.length === 1 ? 'point' : 'points'}</span></div>${brief.summary ? `<p class="brief-summary">${esc(brief.summary)}</p>` : ''}<ul class="brief-points">${sourcePoints}</ul></section>`;
 }
 function feedSummary(video: Row, brief: Row | undefined, transcript: VideoStatus, briefState: VideoStatus) {
   if (brief) return `<p>${esc(brief.summary)}</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read cited source transcript</button>`;
@@ -390,7 +455,7 @@ function transcriptView(video: Row) {
     const highlighted = state.highlights.some((item) => item.passage === passage.id);
     const saved = state.saves.some((item) => item.passage === passage.id);
     const url = sourceUrl(video, passage.start_seconds);
-    return `<article id="passage-${passage.id}" class="passage ${selected ? 'selected' : ''} ${highlighted ? 'highlighted' : ''}" data-passage="${passage.id}">
+    return `<article id="passage-${passage.id}" class="passage ${selected ? 'selected' : ''} ${highlighted ? 'highlighted' : ''}" data-passage="${passage.id}" tabindex="-1">
       <button class="passage-select" data-action="toggle-passage" data-id="${passage.id}" aria-pressed="${selected}" aria-label="${selected ? 'Deselect' : 'Select'} passage at ${fmtTime(passage.start_seconds)}"><span>${selected ? icon('check') : ''}</span></button>
       <div class="passage-time">${url ? `<a href="${esc(url)}" target="_blank" rel="noreferrer" title="Open source at ${fmtTime(passage.start_seconds)}">${fmtTime(passage.start_seconds)}</a>` : `<span>${fmtTime(passage.start_seconds)}</span>`}</div>
       <div class="passage-copy">${passage.speaker ? `<strong>${esc(passage.speaker)}</strong>` : ''}<p>${esc(passage.text)}</p><div class="passage-badges">${highlighted ? '<span>Highlighted</span>' : ''}${saved ? '<span>Saved</span>' : ''}</div></div>
@@ -407,7 +472,7 @@ function transcriptView(video: Row) {
     </div>
     <div class="reader-layout">
       <section class="transcript-panel">
-        <header class="transcript-header"><div class="feed-meta"><span>${esc(state.channels.find((item) => item.id === video.channel)?.name || 'Workspace source')}</span><span>·</span><span>${esc(videoTiming(video))}</span></div><h1>${esc(video.title)}</h1><div class="source-status-panel" aria-label="Video processing status">${statusRow('Transcript', transcript)}${statusRow('Brief', briefState)}</div>${brief ? `<div class="brief-inline"><strong>${esc(brief.title || 'Source brief')}</strong><p>${esc(brief.summary)}</p></div>` : ''}<div class="transcript-meta"><span>${icon('clock')} ${video.duration_seconds ? fmtTime(video.duration_seconds) : 'Length not set'}</span><span>${state.passages.length} ${state.passages.length === 1 ? 'passage' : 'passages'}</span>${language ? `<span>${esc(language)}</span>` : ''}</div></header>
+        <header class="transcript-header"><div class="feed-meta"><span>${esc(state.channels.find((item) => item.id === video.channel)?.name || 'Workspace source')}</span><span>·</span><span>${esc(videoTiming(video))}</span></div><h1>${esc(video.title)}</h1><div class="source-status-panel" aria-label="Video processing status">${statusRow('Transcript', transcript)}${statusRow('Brief', briefState)}</div>${brief ? renderBriefInline(brief) : ''}<div class="transcript-meta"><span>${icon('clock')} ${video.duration_seconds ? fmtTime(video.duration_seconds) : 'Length not set'}</span><span>${state.passages.length} ${state.passages.length === 1 ? 'passage' : 'passages'}</span>${language ? `<span>${esc(language)}</span>` : ''}</div></header>
         <div class="selection-bar ${selectedCount ? 'visible' : ''}" aria-live="polite"><strong>${selectedCount} selected</strong><button data-action="open-highlight">${icon('highlight')} Highlight</button><button data-action="open-save">${icon('bookmark')} Save</button><button data-action="clear-selection">Clear</button></div>
         <div class="transcript-list">${passages || transcriptEmptyState(video, transcript)}</div>
       </section>
@@ -524,7 +589,16 @@ root.addEventListener('click', async (event) => {
   if (action === 'open-video-id') await openVideo(button.dataset.id || '');
   if (action === 'toggle-passage') { const id = button.dataset.id!; state.selectedPassages.has(id) ? state.selectedPassages.delete(id) : state.selectedPassages.add(id); render(); }
   if (action === 'clear-selection') { state.selectedPassages.clear(); render(); }
-  if (action === 'jump-citation') { document.querySelector(`#passage-${CSS.escape(button.dataset.id || '')}`)?.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' }); }
+  if (action === 'jump-citation') {
+    const passage = document.querySelector<HTMLElement>(`#passage-${CSS.escape(button.dataset.id || '')}`);
+    if (passage) {
+      document.querySelectorAll('.passage.citation-target').forEach((item) => item.classList.remove('citation-target'));
+      passage.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' });
+      passage.classList.add('citation-target');
+      passage.focus({ preventScroll: true });
+      window.setTimeout(() => passage.classList.remove('citation-target'), 1800);
+    }
+  }
   if (action === 'copy-share') { await navigator.clipboard.writeText(`${location.origin}/share/${button.dataset.token}`); announce('Public link copied'); }
   if (action === 'revoke-share') {
     button.setAttribute('disabled', '');

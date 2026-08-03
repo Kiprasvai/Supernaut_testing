@@ -188,9 +188,24 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .transcript-meta { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; color: var(--muted); font-size: .84rem; }
 .transcript-meta span, .transcript-meta a { display: inline-flex; align-items: center; gap: 6px; }
 .transcript-meta .icon { width: 16px; }
-.brief-inline { max-width: 70ch; border-radius: 10px; background: var(--wash); padding: 14px 16px; }
+.brief-inline { max-width: 70ch; border-radius: 10px; background: var(--wash); padding: 14px 16px; display: grid; gap: 7px; }
 .brief-inline strong { font-size: .84rem; }
-.brief-inline p { color: var(--ink-soft); margin-top: 4px; }
+.brief-summary { color: var(--ink-soft); white-space: pre-wrap; }
+.brief-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.brief-heading > span { flex: 0 0 auto; border-radius: 999px; background: var(--green-wash); color: oklch(0.4 0.11 155); padding: 4px 9px; font-size: .72rem; font-weight: 700; }
+.brief-points { list-style: none; margin: 5px 0 0; padding: 0; border-top: 1px solid var(--line); }
+.brief-point { display: grid; gap: 7px; padding: 12px 0; }
+.brief-point + .brief-point { border-top: 1px solid var(--line); }
+.brief-point > p { color: var(--ink); line-height: 1.5; }
+.brief-point-citations { display: grid; gap: 2px; }
+.brief-citation { width: 100%; min-height: 44px; display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); align-items: center; gap: 10px; border-radius: 7px; padding: 7px 8px; color: var(--accent-dark); text-align: left; transition: background-color 180ms var(--ease), color 180ms var(--ease); }
+.brief-citation:hover { background: var(--accent-wash); color: var(--ink); }
+.brief-citation > span:first-child { font-size: .75rem; font-weight: 700; white-space: nowrap; }
+.brief-citation > span:last-child { min-width: 0; color: var(--ink-soft); font-size: .78rem; line-height: 1.35; }
+.brief-citation:hover > span:last-child { color: var(--ink); }
+.brief-citation time { color: var(--accent-dark); font-variant-numeric: tabular-nums; font-style: normal; font-weight: 700; }
+.brief-citation i { padding-inline: 5px; color: var(--muted); font-style: normal; }
+.brief-citation.unavailable { cursor: default; color: var(--muted); }
 .selection-bar { position: sticky; top: 0; z-index: 15; display: none; align-items: center; gap: 8px; padding: 9px clamp(20px, 4vw, 55px); background: var(--ink); color: var(--white); box-shadow: 0 5px 18px oklch(0.2 0.02 255 / .14); }
 .selection-bar.visible { display: flex; }
 .selection-bar strong { margin-right: auto; }
@@ -202,6 +217,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .passage:hover { background: var(--wash); }
 .passage.selected { background: var(--accent-wash); }
 .passage.highlighted:not(.selected) { background: var(--amber-wash); }
+.passage.citation-target { background: var(--green-wash); box-shadow: inset 0 0 0 2px oklch(0.68 0.1 155); }
 .passage-select { width: 24px; height: 24px; margin-top: 1px; border: 1px solid oklch(0.73 0.02 255); border-radius: 6px; display: grid; place-items: center; background: var(--white); }
 .passage-select span { width: 100%; height: 100%; display: grid; place-items: center; }
 .passage-select .icon { width: 15px; color: var(--accent-dark); }
@@ -374,6 +390,9 @@ dialog[open] { animation: dialog-in 260ms var(--ease); }
   .transcript-header { padding: 28px 22px 22px; }
   .transcript-header h1 { font-size: 2rem; }
   .source-status-panel { grid-template-columns: 1fr; }
+  .brief-heading { align-items: start; }
+  .brief-heading > span { white-space: nowrap; }
+  .brief-citation { grid-template-columns: 1fr; gap: 2px; }
   .transcript-list { padding-inline: 12px; }
   .passage { grid-template-columns: 26px 48px minmax(0, 1fr); gap: 6px; padding-inline: 5px; }
   .passage-copy p { font-size: .96rem; }
