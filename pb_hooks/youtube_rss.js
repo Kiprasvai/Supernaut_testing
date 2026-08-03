@@ -18,6 +18,7 @@ const MAX_PENDING_VIDEOS_PER_CHANNEL = 2;
 const MAX_CAPTION_ATTEMPTS = 3;
 const IMPORTING_STALE_MS = 60 * 60 * 1000;
 const MAX_CAPTION_EVENTS = 2400;
+const MAX_CAPTION_TRACKS = 20;
 const MAX_TRANSCRIPT_PASSAGES = 160;
 const MAX_PASSAGE_CHARS = 1800;
 const MAX_BRIEF_TRANSCRIPT_CHARS = 16000;
@@ -25,12 +26,67 @@ const MIN_BRIEF_POINTS = 2;
 const MAX_BRIEF_POINTS = 6;
 const MAX_BRIEF_POINT_CHARS = 600;
 
+function utf8BodyText(bytes) {
+  // $http.send documents body as a byte slice. Some current YouTube timedtext
+  // responses leave raw empty while retaining those bytes, so decode the bounded
+  // fallback rather than treating a readable caption as unavailable.
+  if (!bytes || typeof bytes.length !== "number" || bytes.length > MAX_YOUTUBE_PAGE_BODY_CHARS) return "";
+  let output = "";
+  for (let index = 0; index < bytes.length;) {
+    const first = Number(bytes[index++]);
+    if (!isFinite(first) || first < 0 || first > 255) return "";
+    if (first < 0x80) {
+      output += String.fromCharCode(first);
+      continue;
+    }
+    let needed = 0;
+    let codePoint = 0;
+    if (first >= 0xc2 && first <= 0xdf) {
+      needed = 1;
+      codePoint = first & 0x1f;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      needed = 2;
+      codePoint = first & 0x0f;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      needed = 3;
+      codePoint = first & 0x07;
+    } else {
+      output += "\ufffd";
+      continue;
+    }
+    if (index + needed > bytes.length) return "";
+    let valid = true;
+    for (let offset = 0; offset < needed; offset++) {
+      const next = Number(bytes[index++]);
+      if (!isFinite(next) || next < 0x80 || next > 0xbf) {
+        valid = false;
+        break;
+      }
+      codePoint = (codePoint << 6) | (next & 0x3f);
+    }
+    // Reject overlong sequences, surrogate code points, and invalid Unicode.
+    if (!valid || (needed === 1 && codePoint < 0x80) ||
+        (needed === 2 && codePoint < 0x800) ||
+        (needed === 3 && codePoint < 0x10000) ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff) || codePoint > 0x10ffff) {
+      output += "\ufffd";
+      continue;
+    }
+    if (codePoint <= 0xffff) output += String.fromCharCode(codePoint);
+    else {
+      const adjusted = codePoint - 0x10000;
+      output += String.fromCharCode(0xd800 + (adjusted >> 10), 0xdc00 + (adjusted & 0x3ff));
+    }
+  }
+  return output;
+}
+
 function textResponse(response) {
-  if (response && typeof response.raw === "string") return response.raw;
-  // PocketBase versions have exposed the response body under raw; retain this
-  // fallback to make an unexpected adapter shape fail closed rather than parse
-  // an object as feed or caption content.
-  if (response && typeof response.body === "string") return response.body;
+  // Prefer a non-empty raw body, but do not stop at an empty raw string: the
+  // PocketBase HTTP adapter can expose a decoded body only as response.body.
+  if (response && typeof response.raw === "string" && response.raw) return response.raw;
+  if (response && typeof response.body === "string" && response.body) return response.body;
+  if (response && response.body) return utf8BodyText(response.body);
   return "";
 }
 
@@ -288,16 +344,63 @@ function objectAfterMarker(body, marker) {
   throw new Error("YouTube player data was incomplete");
 }
 
+function jsonStringAfterMarker(body, marker) {
+  const found = marker.exec(body);
+  if (!found) return null;
+  let start = found.index + found[0].length;
+  while (start < body.length && /\s/.test(body.charAt(start))) start++;
+  if (body.charAt(start) !== "\"") return null;
+  let escaped = false;
+  for (let index = start + 1; index < body.length; index++) {
+    const char = body.charAt(index);
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "\"") {
+      try {
+        return JSON.parse(body.slice(start, index + 1));
+      } catch (_) {
+        throw new Error("YouTube player data was malformed");
+      }
+    }
+  }
+  throw new Error("YouTube player data was incomplete");
+}
+
 function playerCaptionTracks(watchPage) {
-  // The watch page is fetched only from the fixed URL below. Parse the exact
-  // embedded player object with brace/string accounting instead of evaluating
-  // page script or trusting arbitrary script content.
-  const player = objectAfterMarker(watchPage, /(?:var\s+)?ytInitialPlayerResponse\s*=\s*/);
-  if (!player || typeof player !== "object") throw new Error("YouTube player data was unavailable");
-  const captions = player.captions;
-  const renderer = captions && captions.playerCaptionsTracklistRenderer;
-  if (!renderer || !Array.isArray(renderer.captionTracks)) return [];
-  return renderer.captionTracks;
+  // YouTube currently emits the player response in more than one public page
+  // shape. Parse only JSON literals (never evaluate page script) and retain the
+  // fixed watch-page origin established by the caller.
+  const objectMarkers = [
+    /(?:var\s+)?ytInitialPlayerResponse\s*=\s*/,
+    /window\[['"]ytInitialPlayerResponse['"]\]\s*=\s*/,
+  ];
+  for (const marker of objectMarkers) {
+    const player = objectAfterMarker(watchPage, marker);
+    const captions = player && player.captions;
+    const renderer = captions && captions.playerCaptionsTracklistRenderer;
+    if (renderer && Array.isArray(renderer.captionTracks)) return renderer.captionTracks;
+  }
+
+  // Some current embeds serialize the player response as a JSON-escaped string
+  // inside player vars instead of assigning ytInitialPlayerResponse directly.
+  const serialized = jsonStringAfterMarker(watchPage, /["']player_response["']\s*:\s*/);
+  if (typeof serialized === "string" && serialized.length <= MAX_YOUTUBE_PAGE_BODY_CHARS) {
+    try {
+      const player = JSON.parse(serialized);
+      const captions = player && player.captions;
+      const renderer = captions && captions.playerCaptionsTracklistRenderer;
+      if (renderer && Array.isArray(renderer.captionTracks)) return renderer.captionTracks;
+    } catch (_) {
+      throw new Error("YouTube player data was malformed");
+    }
+  }
+  return [];
 }
 
 function verifiedTimedtextUrl(value, expectedVideoId) {
@@ -326,13 +429,15 @@ function supportedLanguage(value) {
   return /^[A-Za-z0-9_-]{1,35}$/.test(language) ? language : "und";
 }
 
-function chooseCaptionTrack(tracks, expectedVideoId) {
+function captionTrackCandidates(tracks, expectedVideoId) {
   if (!Array.isArray(tracks) || tracks.length === 0) {
     throw terminalError("Public captions are not available for this video.", "unavailable");
   }
-  let fallback = null;
+  const english = [];
+  const fallback = [];
   let sawMalformedTrack = false;
-  for (const track of tracks) {
+  for (let index = 0; index < tracks.length && english.length + fallback.length < MAX_CAPTION_TRACKS; index++) {
+    const track = tracks[index];
     if (!track || typeof track !== "object") {
       sawMalformedTrack = true;
       continue;
@@ -342,12 +447,15 @@ function chooseCaptionTrack(tracks, expectedVideoId) {
       sawMalformedTrack = true;
       continue;
     }
-    const language = supportedLanguage(track.languageCode);
-    const candidate = { url: url, language: language };
-    if (/^en(?:[-_].*)?$/i.test(language)) return candidate;
-    if (!fallback) fallback = candidate;
+    const candidate = { url: url, language: supportedLanguage(track.languageCode) };
+    // Prefer English but retain the remaining verified tracks. A listed
+    // translation can legitimately be empty while a source-language track is
+    // readable, so treating the first candidate as authoritative loses data.
+    if (/^en(?:[-_].*)?$/i.test(candidate.language)) english.push(candidate);
+    else fallback.push(candidate);
   }
-  if (fallback) return fallback;
+  const candidates = english.concat(fallback);
+  if (candidates.length) return candidates;
   if (sawMalformedTrack) throw new Error("YouTube caption track data was unsafe or malformed");
   throw terminalError("Public captions are not available for this video.", "unavailable");
 }
@@ -359,9 +467,56 @@ function normalizedCaptionText(value) {
     .trim();
 }
 
+function timedtextAttribute(attributes, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(attributes || "").match(new RegExp("(?:^|\\s)" + escaped + "\\s*=\\s*([\"'])([\\s\\S]*?)\\1", "i"));
+  return match ? decodeXml(match[2]) : "";
+}
+
+function timedtextXmlJson(value) {
+  const raw = String(value || "");
+  if (!raw || raw.length > MAX_HTTP_BODY_CHARS || !/<(?:transcript|timedtext|body|p|text)(?:\s|>)/i.test(raw)) return null;
+  const events = [];
+  // Legacy timedtext XML uses <text start="seconds" dur="seconds">. Newer
+  // srv3/TTML-style public responses use <p t="milliseconds" d="milliseconds">.
+  const eventPattern = /<(text|p)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi;
+  let match;
+  while ((match = eventPattern.exec(raw)) && events.length < MAX_CAPTION_EVENTS) {
+    const attributes = match[2];
+    const isMilliseconds = match[1].toLowerCase() === "p";
+    const startRaw = timedtextAttribute(attributes, isMilliseconds ? "t" : "start");
+    const durationRaw = timedtextAttribute(attributes, isMilliseconds ? "d" : "dur");
+    const start = Number(startRaw);
+    const duration = Number(durationRaw || 0);
+    if (!isFinite(start) || start < 0 || !isFinite(duration) || duration < 0) continue;
+    events.push({
+      tStartMs: isMilliseconds ? start : start * 1000,
+      dDurationMs: isMilliseconds ? duration : duration * 1000,
+      segs: [{ utf8: match[3] }],
+    });
+  }
+  return events.length ? { events: events } : null;
+}
+
+function captionResponseJson(response) {
+  const rawCaption = textResponse(response);
+  if (rawCaption) {
+    if (rawCaption.length > MAX_HTTP_BODY_CHARS) throw new Error("YouTube captions were unreadable");
+    try {
+      return JSON.parse(rawCaption);
+    } catch (_) {
+      const xmlCaption = timedtextXmlJson(rawCaption);
+      if (xmlCaption) return xmlCaption;
+      throw new Error("YouTube captions returned an unsupported timedtext format");
+    }
+  }
+  if (response && response.json && typeof response.json === "object") return response.json;
+  throw new Error("YouTube captions were unreadable");
+}
+
 function boundedPassages(captionJson) {
   if (!captionJson || !Array.isArray(captionJson.events)) {
-    throw new Error("YouTube captions returned malformed json3 data");
+    throw new Error("YouTube captions returned malformed timedtext data");
   }
   const passages = [];
   let current = null;
@@ -645,37 +800,46 @@ function processCaptions(app, video) {
     }
     const watchPage = textResponse(watchResponse);
     if (!watchPage || watchPage.length > MAX_YOUTUBE_PAGE_BODY_CHARS) throw new Error("YouTube watch page was unreadable");
-    const track = chooseCaptionTrack(playerCaptionTracks(watchPage), videoId);
-    const captionResponse = $http.send({
-      url: track.url,
-      method: "GET",
-      timeout: YOUTUBE_CAPTION_TIMEOUT_SECONDS,
-      headers: { "Accept": "application/json,text/plain" },
-    });
-    if (!captionResponse || captionResponse.statusCode < 200 || captionResponse.statusCode >= 300) {
-      const status = captionResponse ? captionResponse.statusCode : 0;
-      if (status >= 400 && status < 500) {
-        throw terminalError("Public captions are unavailable for this video.", "unavailable");
-      }
-      throw new Error("YouTube captions returned " + (status || "no response"));
-    }
-    const rawCaption = textResponse(captionResponse);
-    let captionJson;
-    if (rawCaption) {
-      // Keep the raw-response cap when this PocketBase adapter exposes one.
-      if (rawCaption.length > MAX_HTTP_BODY_CHARS) throw new Error("YouTube captions were unreadable");
+    const tracks = captionTrackCandidates(playerCaptionTracks(watchPage), videoId);
+    let passages = null;
+    let language = "";
+    let sawReadableResponse = false;
+    let lastError = null;
+    for (const track of tracks) {
+      let captionResponse;
       try {
-        captionJson = JSON.parse(rawCaption);
-      } catch (_) {
-        throw new Error("YouTube captions returned malformed json3 data");
+        captionResponse = $http.send({
+          url: track.url,
+          method: "GET",
+          timeout: YOUTUBE_CAPTION_TIMEOUT_SECONDS,
+          headers: { "Accept": "application/json,application/xml,text/xml,text/plain" },
+        });
+      } catch (error) {
+        lastError = error;
+        continue;
       }
-    } else if (captionResponse && captionResponse.json && typeof captionResponse.json === "object") {
-      // Other PocketBase versions parse a JSON response before returning it.
-      captionJson = captionResponse.json;
-    } else {
-      throw new Error("YouTube captions were unreadable");
+      if (!captionResponse || captionResponse.statusCode < 200 || captionResponse.statusCode >= 300) {
+        const status = captionResponse ? captionResponse.statusCode : 0;
+        lastError = new Error("YouTube captions returned " + (status || "no response"));
+        continue;
+      }
+      sawReadableResponse = true;
+      try {
+        passages = boundedPassages(captionResponseJson(captionResponse));
+        language = track.language;
+        break;
+      } catch (error) {
+        // A public track can be listed but empty (notably some translations).
+        // Continue through the bounded, validated candidates before declaring the
+        // video unavailable or retrying a transient response failure.
+        lastError = error;
+      }
     }
-    const passages = boundedPassages(captionJson);
+    if (!passages) {
+      if (sawReadableResponse && lastError && lastError.terminalKind === "unavailable") throw lastError;
+      if (!sawReadableResponse) throw terminalError("Public captions are unavailable for this video.", "unavailable");
+      throw lastError || new Error("YouTube captions were unreadable");
+    }
     const collection = app.findCollectionByNameOrId("transcript_passages");
     for (let position = 0; position < passages.length; position++) {
       const source = passages[position];
@@ -691,7 +855,7 @@ function processCaptions(app, video) {
     setCaptionState(app, video, {
       status: "ready",
       detail: "Imported " + passages.length + " public-caption transcript passage" + (passages.length === 1 ? "." : "s."),
-      language: track.language,
+      language: language,
       completedAt: new Date().toISOString(),
     });
   } catch (error) {
