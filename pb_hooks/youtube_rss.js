@@ -21,6 +21,9 @@ const MAX_CAPTION_EVENTS = 2400;
 const MAX_TRANSCRIPT_PASSAGES = 160;
 const MAX_PASSAGE_CHARS = 1800;
 const MAX_BRIEF_TRANSCRIPT_CHARS = 16000;
+const MIN_BRIEF_POINTS = 2;
+const MAX_BRIEF_POINTS = 6;
+const MAX_BRIEF_POINT_CHARS = 600;
 
 function textResponse(response) {
   if (response && typeof response.raw === "string") return response.raw;
@@ -443,15 +446,71 @@ function hasBrief(app, videoId) {
 
 function boundedBriefTranscript(passages) {
   let transcript = "";
+  const suppliedPassageIds = {};
   for (const passage of passages) {
-    const line = "[" + passage.getFloat("start_seconds") + "s-" + passage.getFloat("end_seconds") + "s] " + passage.getString("text").trim() + "\n";
+    // Only IDs from records included in the bounded provider context are valid
+    // citations. This prevents the model from citing a passage it never saw.
+    const passageId = typeof passage.id === "string" ? passage.id : "";
+    const text = passage.getString("text").trim();
+    if (!passageId || !text) continue;
+    const line = "[passage_id=" + passageId + "; start_seconds=" + passage.getFloat("start_seconds") + "; end_seconds=" + passage.getFloat("end_seconds") + "] " + text + "\n";
     if (transcript.length + line.length > MAX_BRIEF_TRANSCRIPT_CHARS) {
       transcript += line.slice(0, Math.max(0, MAX_BRIEF_TRANSCRIPT_CHARS - transcript.length));
+      suppliedPassageIds[passageId] = true;
       break;
     }
     transcript += line;
+    suppliedPassageIds[passageId] = true;
   }
-  return transcript.trim();
+  return { transcript: transcript.trim(), suppliedPassageIds: suppliedPassageIds };
+}
+
+function normalizedBriefText(value, maxLength) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function parseBriefResponse(content, suppliedPassageIds) {
+  if (typeof content !== "string" || !content.trim() || content.length > 30000) {
+    throw new Error("Automatic brief provider returned no readable JSON");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (_) {
+    throw new Error("Automatic brief provider returned malformed JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Automatic brief provider returned an invalid JSON object");
+  }
+  const overview = normalizedBriefText(parsed.overview, 1200);
+  if (!overview) throw new Error("Automatic brief provider returned no readable overview");
+  if (!Array.isArray(parsed.points) || parsed.points.length < MIN_BRIEF_POINTS || parsed.points.length > MAX_BRIEF_POINTS) {
+    throw new Error("Automatic brief provider returned an invalid number of source points");
+  }
+
+  const sourcePoints = [];
+  for (const candidate of parsed.points) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const text = normalizedBriefText(candidate.text, MAX_BRIEF_POINT_CHARS);
+    if (!text || !Array.isArray(candidate.passage_ids)) continue;
+    const passageIds = [];
+    const seen = {};
+    for (const candidateId of candidate.passage_ids) {
+      // Model output is untrusted: retain only unique IDs from the exact bounded
+      // transcript sent to the provider, and never persist fabricated IDs.
+      if (typeof candidateId !== "string" || !suppliedPassageIds[candidateId] || seen[candidateId]) continue;
+      seen[candidateId] = true;
+      passageIds.push(candidateId);
+    }
+    // A point without a verified stored-passage citation is not source-grounded.
+    if (!passageIds.length) continue;
+    sourcePoints.push({ text: text, passage_ids: passageIds });
+  }
+  if (sourcePoints.length < MIN_BRIEF_POINTS) {
+    throw new Error("Automatic brief provider did not return enough valid cited points");
+  }
+  return { overview: overview, sourcePoints: sourcePoints };
 }
 
 function processBrief(app, video) {
@@ -476,8 +535,8 @@ function processBrief(app, video) {
 
   try {
     const passages = existingPassages(app, video.id, MAX_TRANSCRIPT_PASSAGES);
-    const transcript = boundedBriefTranscript(passages);
-    if (!transcript) throw new Error("The imported transcript was empty");
+    const context = boundedBriefTranscript(passages);
+    if (!context.transcript) throw new Error("The imported transcript was empty");
     const apiKey = $os.getenv("OPENROUTER_API_KEY");
     if (!apiKey) throw new Error("Automatic briefs are not configured on this backend");
     const model = $os.getenv("OPENROUTER_MODEL") || "openrouter/free";
@@ -495,17 +554,17 @@ function processBrief(app, video) {
         messages: [
           {
             role: "system",
-            content: "Write a concise plain-text brief using only the supplied transcript. Do not add facts, citations, speakers, or claims not explicitly supported by it. If the transcript is insufficient, say so plainly. Keep the brief under 1200 characters.",
+            content: "Use only the supplied transcript passages. Return ONLY strict JSON with exactly this shape: {\"overview\":\"concise overview\",\"points\":[{\"text\":\"source-grounded point\",\"passage_ids\":[\"supplied passage ID\"]}]}. overview must be concise and under 1200 characters. Return 2 to 6 points. Every point must cite one or more exact passage_id values supplied in the transcript. Do not add facts, speakers, claims, markdown, or any keys outside overview and points. If the transcript is insufficient, keep every statement plainly limited to what it supports and still cite the relevant passages.",
           },
-          { role: "user", content: "Transcript:\n" + transcript },
+          { role: "user", content: "Transcript passages:\n" + context.transcript },
         ],
       }),
     });
     if (!provider || provider.statusCode < 200 || provider.statusCode >= 300) {
       throw new Error("Automatic brief provider returned " + (provider ? provider.statusCode : "no response"));
     }
-    const summary = provider.json && provider.json.choices && provider.json.choices[0] && provider.json.choices[0].message && provider.json.choices[0].message.content;
-    if (typeof summary !== "string" || !summary.trim()) throw new Error("Automatic brief provider returned no readable text");
+    const content = provider.json && provider.json.choices && provider.json.choices[0] && provider.json.choices[0].message && provider.json.choices[0].message.content;
+    const briefContent = parseBriefResponse(content, context.suppliedPassageIds);
     // Check again immediately before the write so a manually-created brief is
     // always retained rather than replaced by an automatic one.
     if (hasBrief(app, video.id)) {
@@ -521,7 +580,8 @@ function processBrief(app, video) {
     brief.set("workspace", video.getString("workspace"));
     brief.set("video", video.id);
     brief.set("title", "Automatic brief: " + video.getString("title").slice(0, 270));
-    brief.set("summary", summary.trim().slice(0, 1200));
+    brief.set("summary", briefContent.overview);
+    brief.set("source_points", briefContent.sourcePoints);
     app.save(brief);
     setBriefState(app, video, {
       status: "ready",
