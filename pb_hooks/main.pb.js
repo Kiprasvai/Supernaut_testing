@@ -191,6 +191,52 @@ routerAdd("POST", "/api/practica/citations", (e) => {
   });
 }, $apis.requireAuth("users"));
 
+// Preview is read-only: it evaluates each point only against this member's
+// previously revealed points from earlier briefs in the same workspace.
+routerAdd("POST", "/api/practica/novelty/preview", (e) => {
+  const { requireMembership, requiredString } = require(__hooks + "/practica_utils.js");
+  const { allRecordsByFilter, annotateBrief, findBriefInWorkspace, validateBriefIds } = require(__hooks + "/practica_novelty.js");
+  const body = e.requestInfo().body || {};
+  const workspaceId = requiredString(body.workspace, "workspace", 15);
+  requireMembership(e.app, e.auth.id, workspaceId);
+  const requestedIds = validateBriefIds(body.brief_ids);
+  const briefs = [];
+  if (requestedIds !== null) {
+    // Preserve the caller's requested order while checking every ID belongs to
+    // the authorized workspace.
+    for (const briefId of requestedIds) briefs.push(findBriefInWorkspace(e.app, workspaceId, briefId));
+  } else {
+    briefs.push.apply(briefs, allRecordsByFilter(
+      e.app,
+      "video_briefs",
+      "workspace = {:workspace}",
+      "created,id",
+      { workspace: workspaceId },
+    ));
+  }
+  return e.json(200, { briefs: briefs.map((brief) => annotateBrief(e.app, e.auth.id, workspaceId, brief)) });
+}, $apis.requireAuth("users"));
+
+// Recording an opened brief never implies its points were revealed. Only the
+// explicitly supplied, validated point keys are added to reader point history.
+routerAdd("POST", "/api/practica/novelty/read", (e) => {
+  const { requireMembership, requiredString } = require(__hooks + "/practica_utils.js");
+  const { annotateBrief, derivePoints, findBriefInWorkspace, touchBriefRead, touchPointRead, validatePointKeys } = require(__hooks + "/practica_novelty.js");
+  const body = e.requestInfo().body || {};
+  const workspaceId = requiredString(body.workspace, "workspace", 15);
+  const briefId = requiredString(body.brief, "brief", 15);
+  requireMembership(e.app, e.auth.id, workspaceId);
+  const brief = findBriefInWorkspace(e.app, workspaceId, briefId);
+  const annotation = annotateBrief(e.app, e.auth.id, workspaceId, brief);
+  const pointKeys = validatePointKeys(body.point_keys, derivePoints(brief));
+
+  touchBriefRead(e.app, e.auth.id, workspaceId, brief.id);
+  const byKey = {};
+  for (const point of annotation.points) byKey[point.key] = point;
+  for (const key of pointKeys) touchPointRead(e.app, e.auth.id, workspaceId, brief, byKey[key]);
+  return e.json(200, annotation);
+}, $apis.requireAuth("users"));
+
 routerAdd("POST", "/api/practica/shares", (e) => {
   const { requireMembership, requiredString } = require(__hooks + "/practica_utils.js");
   const body = e.requestInfo().body || {};
