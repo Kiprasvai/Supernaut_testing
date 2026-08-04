@@ -5,7 +5,11 @@ import type { RecordModel } from 'pocketbase';
 type Row = RecordModel & Record<string, any>;
 type Citation = { passage_id: string; position: number; start_seconds: number; end_seconds: number; speaker: string; text: string };
 type BriefCitation = { passageId: string; startSeconds?: number; timestampLabel?: string; text?: string };
-type BriefSourcePoint = { text: string; citations: BriefCitation[] };
+type BriefSourcePoint = { key?: string; text: string; citations: BriefCitation[] };
+type NoveltyStatus = 'new' | 'update' | 'repeated';
+type NoveltyPoint = { key: string; text: string; status: NoveltyStatus; similarity?: number; matched_text?: string };
+type BriefNovelty = { brief_id: string; points: NoveltyPoint[] };
+type NoveltyResponse = { briefs: BriefNovelty[] };
 type Answer = { answer: string; supported: boolean; citations: Citation[]; model?: string };
 type PublicShare = { scope: 'video' | 'brief' | 'transcript'; video: { id: string; title: string; source_url: string; duration_seconds: number }; brief?: { id: string; title: string; summary: string } | null; transcript?: Citation[] };
 type LocalShare = { id: string; token: string; scope: string; expires_at: string; videoId: string; videoTitle: string; revoked?: boolean };
@@ -22,6 +26,8 @@ const state = {
   channels: [] as Row[],
   videos: [] as Row[],
   briefs: [] as Row[],
+  noveltyByBrief: {} as Record<string, BriefNovelty>,
+  revealedRepeatedBriefs: new Set<string>(),
   passages: [] as Row[],
   folders: [] as Row[],
   saves: [] as Row[],
@@ -169,6 +175,7 @@ function briefSourcePoints(brief?: Row): BriefSourcePoint[] {
   const items = Array.isArray(value) ? value : Array.isArray(value?.points) ? value.points : [];
   return items.map((item: any) => {
     if (!item || typeof item === 'string') return { text: String(item || '').trim(), citations: [] };
+    const key = String(item.key ?? item.point_key ?? item.pointKey ?? '').trim() || undefined;
     const text = String(item.point ?? item.text ?? item.claim ?? item.summary ?? item.content ?? '').trim();
     const rawCitations = [
       item.passage_ids,
@@ -195,10 +202,10 @@ function briefSourcePoints(brief?: Row): BriefSourcePoint[] {
       };
     }).filter((citation): citation is BriefCitation => Boolean(citation));
     const uniqueCitations = citations.filter((citation, index) => citations.findIndex((candidate) => candidate.passageId === citation.passageId) === index);
-    return { text, citations: uniqueCitations };
+    return { key, text, citations: uniqueCitations };
   }).filter((point: BriefSourcePoint) => point.text);
 }
-function renderBriefInline(brief: Row) {
+function renderLegacyBriefInline(brief: Row) {
   const points = briefSourcePoints(brief);
   if (!points.length) return `<div class="brief-inline"><strong>${esc(brief.title || 'Source brief')}</strong><p class="brief-summary">${esc(brief.summary)}</p></div>`;
   const sourcePoints = points.map((point, pointIndex) => {
@@ -216,7 +223,72 @@ function renderBriefInline(brief: Row) {
   }).join('');
   return `<section class="brief-inline brief-sourced" aria-labelledby="brief-title-${esc(brief.id)}"><div class="brief-heading"><strong id="brief-title-${esc(brief.id)}">${esc(brief.title || 'Source brief')}</strong><span>${points.length} cited ${points.length === 1 ? 'point' : 'points'}</span></div>${brief.summary ? `<p class="brief-summary">${esc(brief.summary)}</p>` : ''}<ul class="brief-points">${sourcePoints}</ul></section>`;
 }
+function noveltyForBrief(brief?: Row) {
+  return brief ? state.noveltyByBrief[brief.id] : undefined;
+}
+function sortedNoveltyPoints(points: NoveltyPoint[]) {
+  const order: Record<NoveltyStatus, number> = { new: 0, update: 1, repeated: 2 };
+  return points.map((point, index) => ({ point, index })).sort((a, b) => order[a.point.status] - order[b.point.status] || a.index - b.index);
+}
+function noveltyCounts(novelty?: BriefNovelty) {
+  return (novelty?.points || []).reduce((counts, point) => {
+    counts[point.status] += 1;
+    return counts;
+  }, { new: 0, update: 0, repeated: 0 } as Record<NoveltyStatus, number>);
+}
+function noveltyStatusLabel(status: NoveltyStatus) {
+  return status === 'new' ? 'New' : status === 'update' ? 'Adds an update' : 'Already covered';
+}
+function sourcePointForNovelty(brief: Row, novelty: BriefNovelty, point: NoveltyPoint) {
+  const sourcePoints = briefSourcePoints(brief);
+  const exactKey = sourcePoints.find((candidate) => candidate.key && candidate.key === point.key);
+  if (exactKey) return exactKey;
+  const normalizedText = point.text.trim().replace(/\s+/g, ' ').toLowerCase();
+  const textMatch = sourcePoints.find((candidate) => candidate.text.trim().replace(/\s+/g, ' ').toLowerCase() === normalizedText);
+  if (textMatch) return textMatch;
+  const originalIndex = novelty.points.findIndex((candidate) => candidate.key === point.key);
+  return sourcePoints.length === novelty.points.length && originalIndex >= 0 ? sourcePoints[originalIndex] : undefined;
+}
+function renderNoveltyCitations(sourcePoint: BriefSourcePoint | undefined, pointIndex: number) {
+  if (!sourcePoint?.citations.length) return '';
+  const citations = sourcePoint.citations.map((citation, citationIndex) => {
+    const passage = state.passages.find((item) => item.id === citation.passageId);
+    const position = Number(passage?.position);
+    const sourceLabel = Number.isFinite(position) ? `Passage ${position + 1}` : `Source ${citationIndex + 1}`;
+    const startSeconds = Number(passage?.start_seconds ?? citation.startSeconds);
+    const timestamp = Number.isFinite(startSeconds) ? fmtTime(startSeconds) : citation.timestampLabel || '';
+    const excerpt = String(passage?.text || citation.text || '').trim();
+    if (!passage) return `<span class="brief-citation unavailable"><span>${esc(sourceLabel)}</span><span>${timestamp ? `${esc(timestamp)} · ` : ''}Cited passage unavailable</span></span>`;
+    return `<button class="brief-citation" data-action="jump-citation" data-id="${esc(citation.passageId)}" aria-label="Jump to ${esc(sourceLabel)}${timestamp ? ` at ${esc(timestamp)}` : ''}"><span>${esc(sourceLabel)}</span><span>${timestamp ? `<time>${esc(timestamp)}</time><i aria-hidden="true">·</i>` : ''}${esc(excerpt.slice(0, 110))}${excerpt.length > 110 ? '…' : ''}</span></button>`;
+  }).join('');
+  return `<div class="brief-point-citations" aria-label="Sources for brief point ${pointIndex + 1}">${citations}</div>`;
+}
+function renderBriefInline(brief: Row) {
+  const novelty = noveltyForBrief(brief);
+  if (!novelty?.points.length) return renderLegacyBriefInline(brief);
+  const counts = noveltyCounts(novelty);
+  const repeatedVisible = state.revealedRepeatedBriefs.has(brief.id);
+  const sorted = sortedNoveltyPoints(novelty.points);
+  const renderPoint = ({ point, index }: { point: NoveltyPoint; index: number }) => {
+    const sourcePoint = sourcePointForNovelty(brief, novelty, point);
+    return `<li class="brief-point novelty-point novelty-${point.status}"><div class="novelty-point-head"><span class="novelty-status">${noveltyStatusLabel(point.status)}</span></div><p>${esc(point.text)}</p>${renderNoveltyCitations(sourcePoint, index)}</li>`;
+  };
+  const activeRows = sorted.filter(({ point }) => point.status !== 'repeated').map(renderPoint).join('');
+  const repeatedRows = sorted.filter(({ point }) => point.status === 'repeated').map(renderPoint).join('');
+  const repeatedControl = counts.repeated ? `<button class="novelty-reveal" data-action="toggle-repeated" data-brief-id="${esc(brief.id)}" aria-expanded="${repeatedVisible}" aria-controls="repeated-points-${esc(brief.id)}">${repeatedVisible ? 'Hide already-covered points' : `Show ${counts.repeated} already-covered ${counts.repeated === 1 ? 'point' : 'points'}`}</button>` : '';
+  const activeCount = counts.new + counts.update;
+  const activeList = activeRows ? `<ul class="brief-points">${activeRows}</ul>` : '';
+  const repeatedList = counts.repeated ? `<ul class="brief-points repeated-points" id="repeated-points-${esc(brief.id)}" ${repeatedVisible ? '' : 'hidden'}>${repeatedRows}</ul>` : '';
+  return `<section class="brief-inline brief-sourced novelty-brief" aria-labelledby="brief-title-${esc(brief.id)}"><div class="brief-heading"><strong id="brief-title-${esc(brief.id)}">${esc(brief.title || 'Source brief')}</strong><span>${novelty.points.length} ${novelty.points.length === 1 ? 'point' : 'points'}</span></div><div class="novelty-counts" aria-label="${counts.new} new, ${counts.update} updates, ${counts.repeated} already covered"><span class="count-new"><strong>${counts.new}</strong> new</span><span class="count-update"><strong>${counts.update}</strong> ${counts.update === 1 ? 'update' : 'updates'}</span><span class="count-repeated"><strong>${counts.repeated}</strong> covered</span></div>${!activeCount && !repeatedVisible ? '<p class="novelty-covered-note">All points in this brief are already covered. Reveal them if you want to review the detail.</p>' : ''}${activeList}${repeatedList}${repeatedControl}</section>`;
+}
 function feedSummary(video: Row, brief: Row | undefined, transcript: VideoStatus, briefState: VideoStatus) {
+  const novelty = noveltyForBrief(brief);
+  if (brief && novelty?.points.length) {
+    const counts = noveltyCounts(novelty);
+    const leadPoints = sortedNoveltyPoints(novelty.points).filter(({ point }) => point.status !== 'repeated').slice(0, 2);
+    const lead = leadPoints.length ? `<ul class="feed-novelty-points">${leadPoints.map(({ point }) => `<li><span class="novelty-status novelty-${point.status}">${noveltyStatusLabel(point.status)}</span><span>${esc(point.text)}</span></li>`).join('')}</ul>` : '<p class="muted-copy">You have already covered every point in this brief.</p>';
+    return `<div class="novelty-counts feed-novelty-counts" aria-label="${counts.new} new, ${counts.update} updates, ${counts.repeated} already covered"><span class="count-new"><strong>${counts.new}</strong> new</span><span class="count-update"><strong>${counts.update}</strong> ${counts.update === 1 ? 'update' : 'updates'}</span><span class="count-repeated"><strong>${counts.repeated}</strong> covered</span></div>${lead}<button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Open brief and transcript</button>`;
+  }
   if (brief) return `<p>${esc(brief.summary)}</p><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read cited source transcript</button>`;
   if (briefState.tone === 'critical') return `<div class="feed-message critical-message"><strong>Brief could not be created.</strong><span>${esc(briefState.detail || 'The transcript remains available to read and use.')}</span></div>${transcript.tone === 'ready' ? `<button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Read the transcript</button>` : ''}`;
   if (transcript.tone === 'warning' || transcript.tone === 'critical') return `<div class="feed-message warning-message"><strong>${esc(transcript.label)}.</strong><span>${esc(transcript.detail || 'Add a manual transcript to continue.')}</span></div><button class="source-claim" data-action="open-video-id" data-id="${video.id}">${icon('chevron')} Open to add transcript manually</button>`;
@@ -261,7 +333,11 @@ function setBusy(value: boolean) { state.busy = value; render(); }
 async function boot() {
   if (currentPath().startsWith('/share/')) return loadPublicShare(currentPath().split('/')[2] || '');
   if (!pb.authStore.isValid) { state.booted = true; return render(); }
-  try { await loadAccount(); } catch (error) { state.authError = pbMessage(error, 'We could not open your workspace.'); }
+  try {
+    await loadAccount();
+    const videoMatch = currentPath().match(/^\/video\/([^/]+)/);
+    if (videoMatch && state.workspace) await openVideo(videoMatch[1], false);
+  } catch (error) { state.authError = pbMessage(error, 'We could not open your workspace.'); }
   state.booted = true;
   render();
 }
@@ -296,6 +372,42 @@ async function loadAccount() {
     state.workspace = null;
   }
 }
+function applyNoveltyResponse(response: NoveltyResponse | BriefNovelty | undefined) {
+  const briefs = Array.isArray((response as NoveltyResponse | undefined)?.briefs)
+    ? (response as NoveltyResponse).briefs
+    : (response as BriefNovelty | undefined)?.brief_id ? [response as BriefNovelty] : [];
+  for (const brief of briefs) {
+    if (!brief?.brief_id || !Array.isArray(brief.points)) continue;
+    state.noveltyByBrief[brief.brief_id] = {
+      brief_id: brief.brief_id,
+      points: brief.points.filter((point) => point && point.key && point.text && ['new', 'update', 'repeated'].includes(point.status)),
+    };
+  }
+}
+async function loadNoveltyPreview(briefIds: string[]) {
+  if (!state.workspace || !briefIds.length) return;
+  try {
+    const response = await pb.send<NoveltyResponse>('/api/practica/novelty/preview', {
+      method: 'POST',
+      body: { workspace: state.workspace.id, brief_ids: briefIds },
+      requestKey: null,
+    });
+    applyNoveltyResponse(response);
+  } catch {
+    // Novelty is an enhancement: existing summaries and source points remain usable.
+  }
+}
+async function recordBriefRead(brief: Row, pointKeys?: string[]) {
+  if (!state.workspace) return;
+  try {
+    const body: { workspace: string; brief: string; point_keys?: string[] } = { workspace: state.workspace.id, brief: brief.id };
+    if (pointKeys) body.point_keys = pointKeys;
+    const response = await pb.send<NoveltyResponse | BriefNovelty>('/api/practica/novelty/read', { method: 'POST', body, requestKey: null });
+    applyNoveltyResponse(response);
+  } catch {
+    // Reading remains available when the novelty service is temporarily unavailable.
+  }
+}
 async function loadWorkspace() {
   if (!state.workspace) return;
   localStorage.setItem('practica.workspace', state.workspace.id);
@@ -308,7 +420,8 @@ async function loadWorkspace() {
     pb.collection('saved_passage_items').getFullList<Row>({ filter, expand: 'passage,passage.video,folder' }),
     pb.collection('highlights').getFullList<Row>({ filter, expand: 'passage,passage.video' }),
   ]);
-  Object.assign(state, { channels, videos, briefs, folders, saves, highlights });
+  Object.assign(state, { channels, videos, briefs, folders, saves, highlights, noveltyByBrief: {} });
+  await loadNoveltyPreview(briefs.map((brief) => brief.id));
   if (state.selectedVideo) {
     state.selectedVideo = state.videos.find((video) => video.id === state.selectedVideo!.id) || null;
     if (state.selectedVideo) await loadPassages(state.selectedVideo.id);
@@ -320,7 +433,7 @@ async function loadPassages(videoId: string) {
     sort: 'position',
   });
 }
-async function openVideo(videoId: string) {
+async function openVideo(videoId: string, updateHistory = true) {
   const video = state.videos.find((item) => item.id === videoId);
   if (!video) return;
   state.selectedVideo = video;
@@ -328,8 +441,14 @@ async function openVideo(videoId: string) {
   state.answer = null;
   state.answerError = '';
   setBusy(true);
-  try { await loadPassages(videoId); navigate(`/video/${videoId}`); }
-  catch (error) { announce(pbMessage(error, 'The transcript could not be loaded.')); }
+  try {
+    const brief = state.briefs.find((item) => item.video === videoId);
+    const novelty = noveltyForBrief(brief);
+    const visiblePointKeys = novelty?.points.filter((point) => point.status === 'new' || point.status === 'update').map((point) => point.key);
+    await Promise.all([loadPassages(videoId), brief ? recordBriefRead(brief, visiblePointKeys) : Promise.resolve()]);
+    const path = `/video/${videoId}`;
+    if (updateHistory && currentPath() !== path) history.pushState({}, '', path);
+  } catch (error) { announce(pbMessage(error, 'The transcript could not be loaded.')); }
   finally { state.busy = false; render(); }
 }
 
@@ -414,9 +533,14 @@ function onboardingView() {
   </main>`;
 }
 
+function videoNoveltyPriority(video: Row) {
+  const brief = state.briefs.find((item) => item.video === video.id);
+  const counts = noveltyCounts(noveltyForBrief(brief));
+  return counts.new ? 0 : counts.update ? 1 : counts.repeated ? 2 : 3;
+}
 function feedView() {
   const channelPills = state.channels.map((channel) => `<button class="filter-chip ${state.channelFilter === channel.id ? 'selected' : ''}" data-action="filter-channel" data-id="${channel.id}" aria-pressed="${state.channelFilter === channel.id}">${esc(channel.name)}</button>`).join('');
-  const visibleVideos = state.channelFilter ? state.videos.filter((video) => video.channel === state.channelFilter) : state.videos;
+  const visibleVideos = (state.channelFilter ? state.videos.filter((video) => video.channel === state.channelFilter) : state.videos).slice().sort((a, b) => videoNoveltyPriority(a) - videoNoveltyPriority(b));
   const selectedChannel = state.channels.find((channel) => channel.id === state.channelFilter);
   const items = visibleVideos.map((video) => {
     const channel = state.channels.find((item) => item.id === video.channel);
@@ -537,7 +661,7 @@ async function route() {
   if (currentPath().startsWith('/share/')) return loadPublicShare(currentPath().split('/')[2] || '');
   if (!pb.authStore.isValid || !state.workspace) return render();
   const videoMatch = currentPath().match(/^\/video\/([^/]+)/);
-  if (videoMatch && state.selectedVideo?.id !== videoMatch[1]) await openVideo(videoMatch[1]);
+  if (videoMatch && state.selectedVideo?.id !== videoMatch[1]) await openVideo(videoMatch[1], false);
   else render();
 }
 async function loadPublicShare(token: string) {
@@ -574,7 +698,7 @@ root.addEventListener('click', async (event) => {
   const action = button.dataset.action;
   if (action === 'navigate') { event.preventDefault(); navigate(button.dataset.path || '/'); }
   if (action === 'toggle-auth') { state.authMode = state.authMode === 'signin' ? 'signup' : 'signin'; state.authError = ''; render(); }
-  if (action === 'signout') { pb.authStore.clear(); Object.assign(state, { workspace: null, workspaces: [], booted: true }); navigate('/'); }
+  if (action === 'signout') { pb.authStore.clear(); state.revealedRepeatedBriefs.clear(); Object.assign(state, { workspace: null, workspaces: [], noveltyByBrief: {}, selectedVideo: null, booted: true }); navigate('/'); }
   if (action === 'account-menu') { const menu = document.querySelector<HTMLElement>('.account-menu'); if (menu) { menu.hidden = !menu.hidden; button.setAttribute('aria-expanded', String(!menu.hidden)); } }
   if (action === 'filter-channel') { state.channelFilter = button.dataset.id || ''; render(); }
   if (action === 'filter-folder') { state.libraryFilter = button.dataset.id || ''; render(); }
@@ -587,6 +711,21 @@ root.addEventListener('click', async (event) => {
   if (action === 'open-share') dialog('share-dialog')?.showModal();
   if (action === 'close-dialog') button.closest('dialog')?.close();
   if (action === 'open-video-id') await openVideo(button.dataset.id || '');
+  if (action === 'toggle-repeated') {
+    const briefId = button.dataset.briefId || '';
+    const isVisible = state.revealedRepeatedBriefs.has(briefId);
+    if (isVisible) {
+      state.revealedRepeatedBriefs.delete(briefId);
+      render();
+    } else {
+      state.revealedRepeatedBriefs.add(briefId);
+      render();
+      const brief = state.briefs.find((item) => item.id === briefId);
+      const pointKeys = noveltyForBrief(brief)?.points.filter((point) => point.status === 'repeated').map((point) => point.key) || [];
+      if (brief) await recordBriefRead(brief, pointKeys);
+      render();
+    }
+  }
   if (action === 'toggle-passage') { const id = button.dataset.id!; state.selectedPassages.has(id) ? state.selectedPassages.delete(id) : state.selectedPassages.add(id); render(); }
   if (action === 'clear-selection') { state.selectedPassages.clear(); render(); }
   if (action === 'jump-citation') {

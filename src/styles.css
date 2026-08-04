@@ -149,6 +149,19 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .muted-copy { color: var(--muted) !important; }
 .source-claim { display: inline-flex; align-items: center; gap: 5px; justify-self: start; min-height: 36px; color: var(--accent-dark); font-weight: 650; padding: 0; }
 .source-claim .icon { width: 14px; }
+.novelty-counts { display: flex; flex-wrap: wrap; gap: 6px; font-size: .76rem; font-variant-numeric: tabular-nums; }
+.novelty-counts span { display: inline-flex; align-items: baseline; gap: 4px; border-radius: 999px; padding: 4px 8px; font-weight: 650; }
+.novelty-counts strong { font-size: .82rem; }
+.count-new { background: var(--accent-wash); color: var(--accent-dark); }
+.count-update { background: var(--amber-wash); color: oklch(0.39 0.08 80); }
+.count-repeated { background: var(--wash); color: var(--ink-soft); }
+.feed-novelty-counts { margin-top: 2px; }
+.feed-novelty-points { max-width: 65ch; display: grid; gap: 7px; margin: 2px 0; padding: 0; list-style: none; }
+.feed-novelty-points li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start; color: var(--ink-soft); font-size: .91rem; line-height: 1.4; }
+.novelty-status { display: inline-flex; align-items: center; width: max-content; border-radius: 999px; padding: 2px 7px; font-size: .7rem; font-weight: 700; line-height: 1.5; white-space: nowrap; }
+.novelty-status.novelty-new, .novelty-new .novelty-status { background: var(--accent-wash); color: var(--accent-dark); }
+.novelty-status.novelty-update, .novelty-update .novelty-status { background: var(--amber-wash); color: oklch(0.39 0.08 80); }
+.novelty-status.novelty-repeated, .novelty-repeated .novelty-status { background: var(--white); color: var(--ink-soft); box-shadow: inset 0 0 0 1px var(--line); }
 .feed-message { max-width: 65ch; display: grid; gap: 2px; border-radius: 9px; padding: 10px 12px; font-size: .9rem; line-height: 1.4; }
 .feed-message strong { font-size: .82rem; }
 .feed-message.warning-message { background: var(--amber-wash); color: oklch(0.36 0.075 80); }
@@ -197,6 +210,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .brief-point { display: grid; gap: 7px; padding: 12px 0; }
 .brief-point + .brief-point { border-top: 1px solid var(--line); }
 .brief-point > p { color: var(--ink); line-height: 1.5; }
+.novelty-brief { gap: 10px; }
+.novelty-brief .brief-summary { padding-bottom: 2px; }
+.novelty-point { gap: 8px; }
+.novelty-point-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.novelty-repeated > p { color: var(--ink-soft); }
+.novelty-covered-note { max-width: 58ch; color: var(--ink-soft); font-size: .88rem; }
+.novelty-reveal { min-height: 44px; justify-self: start; color: var(--accent-dark); font-weight: 700; text-align: left; }
+.novelty-reveal:hover { text-decoration: underline; }
 .brief-point-citations { display: grid; gap: 2px; }
 .brief-citation { width: 100%; min-height: 44px; display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); align-items: center; gap: 10px; border-radius: 7px; padding: 7px 8px; color: var(--accent-dark); text-align: left; transition: background-color 180ms var(--ease), color 180ms var(--ease); }
 .brief-citation:hover { background: var(--accent-wash); color: var(--ink); }
@@ -380,8 +401,9 @@ dialog[open] { animation: dialog-in 260ms var(--ease); }
   .video-thumb span { width: 35px; height: 35px; }
   .video-thumb small { font-size: .65rem; }
   .title-link h2 { font-size: 1.14rem; }
-  .feed-copy > p, .source-claim, .feed-message { grid-column: 1 / -1; }
+  .feed-copy > p, .feed-novelty-points, .feed-novelty-counts, .source-claim, .feed-message { grid-column: 1 / -1; }
   .feed-copy > p { -webkit-line-clamp: 2; font-size: .9rem; }
+  .feed-novelty-points li { grid-template-columns: 1fr; gap: 4px; }
   .feed-status { grid-column: 1 / -1; padding-left: 119px; grid-template-columns: 1fr; }
   .empty-state > div:last-child { flex-direction: column; width: 100%; }
   .empty-state > div:last-child button { width: 100%; }
